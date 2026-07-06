@@ -2,7 +2,7 @@ const https = require('https');
 const fs = require('fs');
 
 // ============================================================
-// CARREGAR CONFIGURAÇÕES DAS VARIÁVEIS DE AMBIENTE (SEGURANÇA)
+// CARREGAR CONFIGURAÇÕES DAS VARIÁVEIS DE AMBIENTE
 // ============================================================
 const CONFIG = {
   hiper: {
@@ -15,17 +15,27 @@ const CONFIG = {
   }
 };
 
-// Verifica se todas as variáveis foram preenchidas
 if (!CONFIG.hiper.chave || !CONFIG.shopify.loja || !CONFIG.shopify.client_id || !CONFIG.shopify.client_secret) {
   console.error('❌ Erro: Variáveis de ambiente não configuradas!');
   console.error('   Defina: HIPER_CHAVE, SHOPIFY_STORE, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET');
   process.exit(1);
 }
 
-// Estado da última execução
+// ============================================================
+// ESTADO (com fallback)
+// ============================================================
 let ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
 if (fs.existsSync('state.json')) {
-  ESTADO = JSON.parse(fs.readFileSync('state.json', 'utf8'));
+  try {
+    ESTADO = JSON.parse(fs.readFileSync('state.json', 'utf8'));
+    // Garante que pontoDeSincronizacao seja um número válido
+    if (isNaN(ESTADO.pontoDeSincronizacao) || ESTADO.pontoDeSincronizacao < 0) {
+      ESTADO.pontoDeSincronizacao = 0;
+    }
+  } catch (e) {
+    console.warn('⚠️ state.json corrompido, resetando...');
+    ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
+  }
 }
 
 // ============================================================
@@ -90,7 +100,7 @@ function gerarTokenShopify() {
 // 2. PRODUTOS (CRIAR, ATUALIZAR, BUSCAR)
 // ============================================================
 function buscarProdutosHiper(token, pontoSinc = 0) {
-  console.log('🔄 Buscando produtos do Hiper...');
+  console.log(`🔄 Buscando produtos do Hiper (ponto: ${pontoSinc})...`);
   const opcoes = {
     hostname: 'ms-ecommerce.hiper.com.br',
     path: `/api/v1/produtos/pontoDeSincronizacao?pontoDeSincronizacao=${pontoSinc}`,
@@ -141,9 +151,7 @@ function criarProdutoShopify(token, produtoHiper) {
       });
     });
   } else {
-    // Produto sem variações: cria uma única variante com o SKU do produto
     produtoShopify.product.variants.push({
-      title: 'Default Title',
       price: produtoHiper.preco.toString(),
       sku: produtoHiper.codigoDeBarras || '',
       inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
@@ -173,7 +181,6 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   let variantsAtualizados = [];
 
   if (produtoHiper.variacao && produtoHiper.variacao.length > 0) {
-    // Produto com variações no Hiper
     const mapaExistente = {};
     produtoExistente.variants.forEach(v => { mapaExistente[v.sku] = v; });
 
@@ -197,38 +204,19 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       }
     });
   } else {
-    // Produto SEM variações no Hiper
     const sku = produtoHiper.codigoDeBarras || '';
+    const existente = produtoExistente.variants[0];
     
-    // Verifica se já existe uma variante com este SKU
-    const varianteExistente = produtoExistente.variants.find(v => v.sku === sku);
-    
-    if (varianteExistente) {
-      // Se existe, atualiza a variante existente (pode ser "Default Title" ou outra)
+    if (existente) {
       variantsAtualizados.push({
-        id: varianteExistente.id,
+        id: existente.id,
         sku: sku,
-        title: 'Default Title',  // Mantém o título padrão
         price: produtoHiper.preco.toString(),
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
       });
     } else {
-      // Se não existe, cria uma nova variante com o SKU
-      // Primeiro, mantemos todas as variantes existentes (caso haja outras)
-      produtoExistente.variants.forEach(v => {
-        variantsAtualizados.push({
-          id: v.id,
-          sku: v.sku,
-          title: v.title || 'Default Title',
-          price: v.price,
-          inventory_quantity: v.inventory_quantity
-        });
-      });
-      
-      // Agora adicionamos a nova variante
       variantsAtualizados.push({
         sku: sku,
-        title: 'Default Title',
         price: produtoHiper.preco.toString(),
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
       });
@@ -268,7 +256,7 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
 // 3. PEDIDOS (BUSCAR NA SHOPIFY E ENVIAR PARA O HIPER)
 // ============================================================
 function buscarPedidosShopify(token, sinceId = 0) {
-  console.log('🔄 Buscando pedidos novos na Shopify (since_id: ' + sinceId + ')...');
+  console.log(`🔄 Buscando pedidos novos na Shopify (since_id: ${sinceId})...`);
   const path = `/admin/api/2026-07/orders.json?status=any&since_id=${sinceId}&limit=50`;
   const opcoes = {
     hostname: `${CONFIG.shopify.loja}.myshopify.com`,
@@ -423,7 +411,7 @@ function cancelarPedidoHiper(token, pedidoId) {
 }
 
 // ============================================================
-// FUNÇÃO PRINCIPAL (RODA TUDO)
+// FUNÇÃO PRINCIPAL (com fallback e salvamento condicional)
 // ============================================================
 async function sincronizar() {
   console.log('\n🚀 INICIANDO SINCRONIZAÇÃO COMPLETA (PRODUTOS + PEDIDOS)...\n');
@@ -435,8 +423,24 @@ async function sincronizar() {
     // --- PARTE 1: PRODUTOS ---
     const produtosHiper = await buscarProdutosHiper(tokenHiper, ESTADO.pontoDeSincronizacao || 0);
 
+    // Se não encontrou produtos, pode ser porque o ponto salvo está avançado.
+    // Tenta com ponto=0 como fallback
+    let produtos = produtosHiper.produtos || [];
+    let ponto = produtosHiper.pontoDeSincronizacao;
+
+    if (produtos.length === 0 && ESTADO.pontoDeSincronizacao > 0) {
+      console.warn('⚠️ Nenhum produto com o ponto atual. Tentando sincronização completa (ponto=0)...');
+      const fallback = await buscarProdutosHiper(tokenHiper, 0);
+      if (fallback.produtos && fallback.produtos.length > 0) {
+        produtos = fallback.produtos;
+        ponto = fallback.pontoDeSincronizacao;
+        console.log(`✅ Fallback encontrou ${produtos.length} produtos.`);
+      }
+    }
+
+    // Constrói mapa SKU -> ID do Hiper
     const mapaSkuHiper = {};
-    for (const produto of produtosHiper.produtos || []) {
+    for (const produto of produtos) {
       if (produto.variacao && produto.variacao.length > 0) {
         produto.variacao.forEach(v => {
           if (v.codigoDeBarras) mapaSkuHiper[v.codigoDeBarras] = v.id;
@@ -449,7 +453,7 @@ async function sincronizar() {
     let criados = 0;
     let atualizados = 0;
 
-    for (const produto of produtosHiper.produtos || []) {
+    for (const produto of produtos) {
       if (produto.removido || !produto.ativo) continue;
       if (produto.produtoPrimarioId && produto.produtoPrimarioId !== '00000000-0000-0000-0000-000000000000') continue;
 
@@ -478,8 +482,17 @@ async function sincronizar() {
       }
     }
 
-    if (produtosHiper.pontoDeSincronizacao) {
-      ESTADO.pontoDeSincronizacao = produtosHiper.pontoDeSincronizacao;
+    // SÓ SALVA O PONTO SE TIVER PRODUTOS ENCONTRADOS
+    if (produtos.length > 0 && ponto && !isNaN(ponto) && ponto >= 0) {
+      // Só atualiza se o novo ponto for maior que o atual (evita regressão)
+      if (ponto > ESTADO.pontoDeSincronizacao) {
+        ESTADO.pontoDeSincronizacao = ponto;
+        console.log(`📌 Ponto de sincronização atualizado para ${ponto}`);
+      } else {
+        console.log(`📌 Ponto atual (${ESTADO.pontoDeSincronizacao}) já é maior ou igual ao novo (${ponto}), mantendo.`);
+      }
+    } else {
+      console.log(`📌 Nenhum produto encontrado. Ponto de sincronização NÃO foi alterado.`);
     }
 
     console.log(`\n--- SINC. PRODUTOS CONCLUÍDA ---`);
@@ -524,7 +537,7 @@ async function sincronizar() {
       }
     }
 
-    // Salva o estado
+    // Salva o estado (apenas se houver alterações relevantes)
     fs.writeFileSync('state.json', JSON.stringify(ESTADO, null, 2));
     console.log(`\n✅ ESTADO SALVO. Próxima execução não repetirá os mesmos itens.`);
 
@@ -534,7 +547,7 @@ async function sincronizar() {
 }
 
 // ============================================================
-// EXPORTAR FUNÇÕES PARA USO EXTERNO
+// EXPORTAR FUNÇÕES
 // ============================================================
 module.exports = {
   sincronizar,
