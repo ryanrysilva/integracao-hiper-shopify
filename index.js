@@ -141,7 +141,9 @@ function criarProdutoShopify(token, produtoHiper) {
       });
     });
   } else {
+    // Produto sem variações: cria uma única variante com o SKU do produto
     produtoShopify.product.variants.push({
+      title: 'Default Title',
       price: produtoHiper.preco.toString(),
       sku: produtoHiper.codigoDeBarras || '',
       inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
@@ -171,6 +173,7 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   let variantsAtualizados = [];
 
   if (produtoHiper.variacao && produtoHiper.variacao.length > 0) {
+    // Produto com variações no Hiper
     const mapaExistente = {};
     produtoExistente.variants.forEach(v => { mapaExistente[v.sku] = v; });
 
@@ -194,19 +197,38 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       }
     });
   } else {
+    // Produto SEM variações no Hiper
     const sku = produtoHiper.codigoDeBarras || '';
-    const existente = produtoExistente.variants[0];
     
-    if (existente) {
+    // Verifica se já existe uma variante com este SKU
+    const varianteExistente = produtoExistente.variants.find(v => v.sku === sku);
+    
+    if (varianteExistente) {
+      // Se existe, atualiza a variante existente (pode ser "Default Title" ou outra)
       variantsAtualizados.push({
-        id: existente.id,
+        id: varianteExistente.id,
         sku: sku,
+        title: 'Default Title',  // Mantém o título padrão
         price: produtoHiper.preco.toString(),
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
       });
     } else {
+      // Se não existe, cria uma nova variante com o SKU
+      // Primeiro, mantemos todas as variantes existentes (caso haja outras)
+      produtoExistente.variants.forEach(v => {
+        variantsAtualizados.push({
+          id: v.id,
+          sku: v.sku,
+          title: v.title || 'Default Title',
+          price: v.price,
+          inventory_quantity: v.inventory_quantity
+        });
+      });
+      
+      // Agora adicionamos a nova variante
       variantsAtualizados.push({
         sku: sku,
+        title: 'Default Title',
         price: produtoHiper.preco.toString(),
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
       });
@@ -502,10 +524,6 @@ async function sincronizar() {
       }
     }
 
-    // --- PARTE 4: CANCELAR PEDIDO (exemplo de como usar) ---
-    // Descomente a linha abaixo para testar o cancelamento de um pedido específico
-    // await cancelarPedidoHiper(tokenHiper, 'ID_DO_PEDIDO_AQUI');
-
     // Salva o estado
     fs.writeFileSync('state.json', JSON.stringify(ESTADO, null, 2));
     console.log(`\n✅ ESTADO SALVO. Próxima execução não repetirá os mesmos itens.`);
@@ -516,7 +534,7 @@ async function sincronizar() {
 }
 
 // ============================================================
-// EXPORTAR FUNÇÕES PARA USO EXTERNO (se necessário)
+// EXPORTAR FUNÇÕES PARA USO EXTERNO
 // ============================================================
 module.exports = {
   sincronizar,
