@@ -28,7 +28,6 @@ let ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
 if (fs.existsSync('state.json')) {
   try {
     ESTADO = JSON.parse(fs.readFileSync('state.json', 'utf8'));
-    // Garante que pontoDeSincronizacao seja um número válido
     if (isNaN(ESTADO.pontoDeSincronizacao) || ESTADO.pontoDeSincronizacao < 0) {
       ESTADO.pontoDeSincronizacao = 0;
     }
@@ -175,15 +174,20 @@ function criarProdutoShopify(token, produtoHiper) {
   });
 }
 
+// ============================================================
+// FUNÇÃO ATUALIZAR PRODUTO (CORRIGIDA PARA DEFAULT TITLE)
+// ============================================================
 function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (incluindo PREÇO e ESTOQUE)...`);
+
+  const mapaExistente = {};
+  produtoExistente.variants.forEach(v => { 
+    mapaExistente[v.sku] = v; 
+  });
 
   let variantsAtualizados = [];
 
   if (produtoHiper.variacao && produtoHiper.variacao.length > 0) {
-    const mapaExistente = {};
-    produtoExistente.variants.forEach(v => { mapaExistente[v.sku] = v; });
-
     produtoHiper.variacao.forEach(variacaoHiper => {
       const sku = variacaoHiper.codigoDeBarras || '';
       const existente = mapaExistente[sku];
@@ -205,11 +209,20 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     });
   } else {
     const sku = produtoHiper.codigoDeBarras || '';
-    const existente = produtoExistente.variants[0];
+    const existente = mapaExistente[sku];
+    const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title' && !v.sku);
     
     if (existente) {
       variantsAtualizados.push({
         id: existente.id,
+        sku: sku,
+        price: produtoHiper.preco.toString(),
+        inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
+      });
+    } else if (defaultVariant) {
+      console.log(`🔁 Substituindo "Default Title" por SKU ${sku}`);
+      variantsAtualizados.push({
+        id: defaultVariant.id,
         sku: sku,
         price: produtoHiper.preco.toString(),
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
@@ -372,9 +385,6 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
   });
 }
 
-// ============================================================
-// 4. CONSULTAR PEDIDO NO HIPER
-// ============================================================
 function consultarPedidoHiper(token, pedidoId) {
   console.log(`🔄 Consultando pedido ${pedidoId} no Hiper...`);
   const opcoes = {
@@ -391,9 +401,6 @@ function consultarPedidoHiper(token, pedidoId) {
   });
 }
 
-// ============================================================
-// 5. CANCELAR PEDIDO NO HIPER
-// ============================================================
 function cancelarPedidoHiper(token, pedidoId) {
   console.log(`🔄 Cancelando pedido ${pedidoId} no Hiper...`);
   const opcoes = {
@@ -420,11 +427,9 @@ async function sincronizar() {
     const tokenHiper = await gerarTokenHiper();
     const tokenShopify = await gerarTokenShopify();
 
-    // --- PARTE 1: PRODUTOS ---
+    // --- PRODUTOS ---
     const produtosHiper = await buscarProdutosHiper(tokenHiper, ESTADO.pontoDeSincronizacao || 0);
 
-    // Se não encontrou produtos, pode ser porque o ponto salvo está avançado.
-    // Tenta com ponto=0 como fallback
     let produtos = produtosHiper.produtos || [];
     let ponto = produtosHiper.pontoDeSincronizacao;
 
@@ -438,7 +443,6 @@ async function sincronizar() {
       }
     }
 
-    // Constrói mapa SKU -> ID do Hiper
     const mapaSkuHiper = {};
     for (const produto of produtos) {
       if (produto.variacao && produto.variacao.length > 0) {
@@ -482,9 +486,7 @@ async function sincronizar() {
       }
     }
 
-    // SÓ SALVA O PONTO SE TIVER PRODUTOS ENCONTRADOS
     if (produtos.length > 0 && ponto && !isNaN(ponto) && ponto >= 0) {
-      // Só atualiza se o novo ponto for maior que o atual (evita regressão)
       if (ponto > ESTADO.pontoDeSincronizacao) {
         ESTADO.pontoDeSincronizacao = ponto;
         console.log(`📌 Ponto de sincronização atualizado para ${ponto}`);
@@ -499,7 +501,7 @@ async function sincronizar() {
     console.log(`📦 ${criados} produtos CRIADOS.`);
     console.log(`🔄 ${atualizados} produtos ATUALIZADOS.`);
 
-    // --- PARTE 2: PEDIDOS NOVOS ---
+    // --- PEDIDOS ---
     const pedidos = await buscarPedidosShopify(tokenShopify, ESTADO.ultimoPedidoId || 0);
 
     let enviados = 0;
@@ -525,7 +527,6 @@ async function sincronizar() {
     console.log(`\n--- SINC. PEDIDOS CONCLUÍDA ---`);
     console.log(`📦 ${enviados} pedidos enviados para o Hiper.`);
 
-    // --- PARTE 3: CONSULTAR PEDIDOS ENVIADOS ---
     if (pedidosEnviados.length > 0) {
       console.log(`\n--- CONSULTANDO STATUS DOS PEDIDOS ENVIADOS ---`);
       for (const p of pedidosEnviados) {
@@ -537,7 +538,6 @@ async function sincronizar() {
       }
     }
 
-    // Salva o estado (apenas se houver alterações relevantes)
     fs.writeFileSync('state.json', JSON.stringify(ESTADO, null, 2));
     console.log(`\n✅ ESTADO SALVO. Próxima execução não repetirá os mesmos itens.`);
 
