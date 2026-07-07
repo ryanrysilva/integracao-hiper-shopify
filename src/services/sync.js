@@ -100,6 +100,9 @@ async function buscarProdutoPorMetafield(token, hiperId) {
   }
 }
 
+// ============================================================
+// FUNÇÃO PRINCIPAL DE SINCRONIZAÇÃO
+// ============================================================
 async function sincronizar() {
   console.log('\n🚀 INICIANDO SINCRONIZAÇÃO COMPLETA (PRODUTOS + PEDIDOS)...\n');
   
