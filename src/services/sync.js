@@ -1,7 +1,7 @@
 // src/services/sync.js
 const fs = require('fs');
 const { gerarTokenHiper, buscarProdutosHiper, enviarPedidoParaHiper, consultarPedidoHiper, cancelarPedidoHiper } = require('./hiper.js');
-const { gerarTokenShopify, buscarProdutoPorSKU, criarProdutoShopify, atualizarProdutoShopify, buscarPedidosShopify } = require('./shopify.js');
+const { gerarTokenShopify, buscarProdutoPorSKU, criarProdutoShopify, arquivarProdutoShopify, buscarPedidosShopify } = require('./shopify.js');
 
 let ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
 if (fs.existsSync('state.json')) {
@@ -55,13 +55,47 @@ async function sincronizar() {
 
     let criados = 0;
     let atualizados = 0;
+    let arquivados = 0;
 
+    // Primeiro: arquiva produtos existentes com os mesmos SKUs (se não tiverem metafield)
+    console.log('\n🧹 Verificando produtos existentes para evitar duplicatas...');
+    for (const produto of produtos) {
+      if (produto.removido || !produto.ativo) continue;
+      if (produto.produtoPrimarioId && produto.produtoPrimarioId !== '00000000-0000-0000-0000-000000000000') continue;
+
+      let sku = produto.codigoDeBarras;
+      if (!sku && produto.variacao && produto.variacao.length > 0) {
+        sku = produto.variacao[0].codigoDeBarras;
+      }
+      if (!sku) continue;
+
+      try {
+        const existe = await buscarProdutoPorSKU(tokenShopify, sku);
+        if (existe) {
+          // Verifica se o produto tem metafield do Hiper
+          const temMetafield = existe.metafields && existe.metafields.some(mf => 
+            mf.namespace === 'hiper' && mf.key === 'product_id'
+          );
+          if (!temMetafield) {
+            console.log(`📦 Arquivando produto antigo "${produto.nome}" (SKU: ${sku})...`);
+            await arquivarProdutoShopify(tokenShopify, existe.id);
+            arquivados++;
+            // Aguarda um pouco para não sobrecarregar a API
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
+      } catch (erro) {
+        console.warn(`⚠️ Erro ao verificar produto ${produto.nome}: ${erro.message}`);
+      }
+    }
+
+    // Segundo: cria ou atualiza os produtos
+    console.log('\n🚀 Criando/atualizando produtos...');
     for (const produto of produtos) {
       if (produto.removido || !produto.ativo) continue;
       if (produto.produtoPrimarioId && produto.produtoPrimarioId !== '00000000-0000-0000-0000-000000000000') continue;
 
       try {
-        // Obtém o SKU principal do produto (primeira variação ou o próprio)
         let sku = produto.codigoDeBarras;
         if (!sku && produto.variacao && produto.variacao.length > 0) {
           sku = produto.variacao[0].codigoDeBarras;
@@ -71,15 +105,30 @@ async function sincronizar() {
           continue;
         }
 
-        // Busca o produto na Shopify pelo SKU
+        // Busca novamente (pode ter sido arquivado)
         const existe = await buscarProdutoPorSKU(tokenShopify, sku);
 
         if (existe) {
           console.log(`📦 Produto "${produto.nome}" encontrado (SKU: ${sku}). Atualizando...`);
-          const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe);
-          if (atualizado) atualizados++;
+          // Verifica se tem metafield
+          const temMetafield = existe.metafields && existe.metafields.some(mf => 
+            mf.namespace === 'hiper' && mf.key === 'product_id'
+          );
+          if (temMetafield) {
+            // Se tem metafield, apenas atualiza
+            const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe);
+            if (atualizado) atualizados++;
+          } else {
+            // Se não tem metafield, arquiva e recria
+            console.log(`🔄 Produto "${produto.nome}" sem metafield. Recriando...`);
+            await arquivarProdutoShopify(tokenShopify, existe.id);
+            await new Promise(resolve => setTimeout(resolve, 500));
+            await criarProdutoShopify(tokenShopify, produto);
+            criados++;
+          }
         } else {
-          console.log(`🆕 Produto "${produto.nome}" não encontrado. Criando...`);
+          // Produto não existe, cria
+          console.log(`🆕 Produto "${produto.nome}" não encontrado (SKU: ${sku}). Criando...`);
           await criarProdutoShopify(tokenShopify, produto);
           criados++;
         }
@@ -89,7 +138,7 @@ async function sincronizar() {
       }
     }
 
-    if (produtos.length > 0 && (criados > 0 || atualizados > 0)) {
+    if (produtos.length > 0 && (criados > 0 || atualizados > 0 || arquivados > 0)) {
       if (ponto && !isNaN(ponto) && ponto >= 0 && ponto > ESTADO.pontoDeSincronizacao) {
         ESTADO.pontoDeSincronizacao = ponto;
         console.log(`📌 Ponto de sincronização atualizado para ${ponto}`);
@@ -103,6 +152,7 @@ async function sincronizar() {
     console.log(`\n--- SINC. PRODUTOS CONCLUÍDA ---`);
     console.log(`📦 ${criados} produtos CRIADOS.`);
     console.log(`🔄 ${atualizados} produtos ATUALIZADOS.`);
+    console.log(`📦 ${arquivados} produtos ARQUIVADOS (antigos).`);
 
     // --- PEDIDOS ---
     const pedidos = await buscarPedidosShopify(tokenShopify, ESTADO.ultimoPedidoId || 0);
