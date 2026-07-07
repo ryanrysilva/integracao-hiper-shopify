@@ -42,6 +42,7 @@ function buscarProdutoPorHiperId(token, hiperId) {
 // BUSCA PRODUTO POR SKU (FALLBACK)
 // ============================================================
 function buscarProdutoNaShopifyPorSKU(token, sku) {
+  if (!sku) return Promise.resolve(null);
   const opcoes = {
     hostname: `${CONFIG.shopify.loja}.myshopify.com`,
     path: `/admin/api/2026-07/products.json?sku=${encodeURIComponent(sku)}`,
@@ -171,7 +172,7 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// ATUALIZAR PRODUTO (COM VERIFICAÇÃO DE METAFIELD)
+// ATUALIZAR PRODUTO (COM VERIFICAÇÕES DE SEGURANÇA)
 // ============================================================
 async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e estoque)...`);
@@ -191,11 +192,9 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   // 2. Se não encontrou pelo ID, busca por SKU
   if (!produtoAtual) {
     produtoAtual = await buscarProdutoNaShopifyPorSKU(token, sku);
-    // Se encontrou por SKU, verifica se tem metafield
     if (produtoAtual) {
       const temMetafield = produtoTemMetafieldHiper(produtoAtual);
       if (!temMetafield) {
-        // Produto legado (sem metafield) → arquivar e criar novo
         console.log(`📦 Produto "${produtoHiper.nome}" encontrado por SKU, mas sem metafield. Arquivando e criando novo...`);
         await arquivarProdutoShopify(token, produtoAtual.id);
         await new Promise(resolve => setTimeout(resolve, 1500));
@@ -210,7 +209,17 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     return criarProdutoShopify(token, produtoHiper);
   }
 
-  // 4. Remove a Default Title se existir
+  // ============================================================
+  // VERIFICAÇÕES DE SEGURANÇA: produtoAtual DEVE TER 'variants'
+  // ============================================================
+  if (!produtoAtual.variants || !Array.isArray(produtoAtual.variants)) {
+    console.warn(`⚠️ Produto "${produtoHiper.nome}" não tem variantes válidas. Recriando...`);
+    await arquivarProdutoShopify(token, produtoAtual.id);
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    return criarProdutoShopify(token, produtoHiper);
+  }
+
+  // Remove a Default Title se existir
   let produtoProcessado = produtoAtual;
   const defaultVariant = produtoAtual.variants.find(v => v.title === 'Default Title');
   if (defaultVariant) {
@@ -227,7 +236,7 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       await new Promise(resolve => setTimeout(resolve, 1000));
       const recarregado = await buscarProdutoPorHiperId(token, produtoHiper.id) || 
                           await buscarProdutoNaShopifyPorSKU(token, sku);
-      if (recarregado) {
+      if (recarregado && recarregado.variants) {
         produtoProcessado = recarregado;
       }
     } catch (erro) {
@@ -239,9 +248,11 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   }
 
-  // 5. Monta a atualização
+  // Monta a atualização (garantindo que produtoProcessado tem variants)
   const mapaExistente = {};
-  produtoProcessado.variants.forEach(v => { mapaExistente[v.sku] = v; });
+  if (produtoProcessado.variants && Array.isArray(produtoProcessado.variants)) {
+    produtoProcessado.variants.forEach(v => { mapaExistente[v.sku] = v; });
+  }
 
   let variantsAtualizados = [];
 
