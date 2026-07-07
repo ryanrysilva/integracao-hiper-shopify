@@ -176,18 +176,29 @@ function criarProdutoShopify(token, produtoHiper) {
   });
 }
 
+// ============================================================
+// FUNÇÃO ATUALIZAR PRODUTO (CORRIGIDA PARA METAFIELD)
+// ============================================================
 function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (incluindo PREÇO e ESTOQUE)...`);
 
+  // Mapeia variantes existentes por SKU
   const mapaExistente = {};
-  produtoExistente.variants.forEach(v => { mapaExistente[v.sku] = v; });
+  produtoExistente.variants.forEach(v => {
+    mapaExistente[v.sku] = v;
+  });
+
+  // Identifica a variante "Default Title" (se existir)
+  const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title' && !v.sku);
 
   let variantsAtualizados = [];
 
+  // Caso 1: Produto com variações no Hiper
   if (produtoHiper.variacao && produtoHiper.variacao.length > 0) {
     produtoHiper.variacao.forEach(variacaoHiper => {
       const sku = variacaoHiper.codigoDeBarras || '';
       const existente = mapaExistente[sku];
+      
       if (existente) {
         variantsAtualizados.push({
           id: existente.id,
@@ -204,11 +215,12 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       }
     });
   } else {
+    // Caso 2: Produto SEM variações no Hiper
     const sku = produtoHiper.codigoDeBarras || '';
     const existente = mapaExistente[sku];
-    const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title' && !v.sku);
-    
+
     if (existente) {
+      // Atualiza variante existente
       variantsAtualizados.push({
         id: existente.id,
         sku: sku,
@@ -216,14 +228,17 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
       });
     } else if (defaultVariant) {
-      console.log(`🔁 Substituindo "Default Title" por SKU ${sku}`);
+      // REMOVE a Default Title e CRIA uma nova com o SKU correto
+      console.log(`🗑️ Removendo "Default Title" e criando nova variante com SKU ${sku}`);
+      // Não incluímos a Default Title no array de variantes atualizadas
+      // Ela será removida automaticamente ao enviar a atualização
       variantsAtualizados.push({
-        id: defaultVariant.id,
         sku: sku,
         price: produtoHiper.preco.toString(),
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
       });
     } else {
+      // Se não existe nenhuma variante, cria nova
       variantsAtualizados.push({
         sku: sku,
         price: produtoHiper.preco.toString(),
@@ -232,6 +247,7 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   }
 
+  // Monta a atualização
   const atualizacao = {
     product: {
       id: produtoExistente.id,
@@ -414,7 +430,7 @@ function cancelarPedidoHiper(token, pedidoId) {
 }
 
 // ============================================================
-// FUNÇÃO PRINCIPAL (com fallback robusto)
+// FUNÇÃO PRINCIPAL
 // ============================================================
 async function sincronizar() {
   console.log('\n🚀 INICIANDO SINCRONIZAÇÃO COMPLETA (PRODUTOS + PEDIDOS)...\n');
@@ -429,7 +445,6 @@ async function sincronizar() {
     let pontoOriginal = ESTADO.pontoDeSincronizacao;
 
     try {
-      // Tenta com o ponto salvo
       const resposta = await buscarProdutosHiper(tokenHiper, pontoOriginal);
       produtos = resposta.produtos || [];
       ponto = resposta.pontoDeSincronizacao;
@@ -441,14 +456,12 @@ async function sincronizar() {
       ponto = resposta.pontoDeSincronizacao;
     }
 
-    // Se mesmo assim não tiver produtos, avisa e encerra a parte de produtos
     if (produtos.length === 0) {
       console.warn('⚠️ Nenhum produto encontrado. Verifique se há produtos com a flag "Loja virtual" ativada.');
     } else {
       console.log(`✅ ${produtos.length} produtos encontrados no Hiper.`);
     }
 
-    // Constrói mapa SKU -> ID do Hiper
     const mapaSkuHiper = {};
     for (const produto of produtos) {
       if (produto.variacao && produto.variacao.length > 0) {
@@ -492,7 +505,6 @@ async function sincronizar() {
       }
     }
 
-    // Atualiza o ponto de sincronização apenas se encontrou produtos e o ponto é válido
     if (produtos.length > 0 && ponto && !isNaN(ponto) && ponto >= 0) {
       if (ponto > ESTADO.pontoDeSincronizacao) {
         ESTADO.pontoDeSincronizacao = ponto;
