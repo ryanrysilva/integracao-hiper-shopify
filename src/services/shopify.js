@@ -25,7 +25,6 @@ function gerarTokenShopify() {
 // BUSCA PRODUTO POR METAFIELD (ID DO HIPER)
 // ============================================================
 function buscarProdutoPorHiperId(token, hiperId) {
-  // Busca produtos que têm o metafield "hiper_id" com o valor do ID do Hiper
   const query = `metafields.owner_type:Product AND metafields.namespace:hiper AND metafields.key:product_id AND metafields.value:${hiperId}`;
   const opcoes = {
     hostname: `${CONFIG.shopify.loja}.myshopify.com`,
@@ -53,6 +52,16 @@ function buscarProdutoNaShopifyPorSKU(token, sku) {
     if (res.errors) throw new Error(JSON.stringify(res.errors));
     return res.products && res.products.length > 0 ? res.products[0] : null;
   });
+}
+
+// ============================================================
+// VERIFICA SE PRODUTO TEM METAFIELD DO HIPER
+// ============================================================
+function produtoTemMetafieldHiper(produto) {
+  if (!produto || !produto.metafields) return false;
+  return produto.metafields.some(mf => 
+    mf.namespace === 'hiper' && mf.key === 'product_id'
+  );
 }
 
 // ============================================================
@@ -162,7 +171,7 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// ATUALIZAR PRODUTO (COM VERIFICAÇÃO POR HIPER ID)
+// ATUALIZAR PRODUTO (COM VERIFICAÇÃO DE METAFIELD)
 // ============================================================
 async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e estoque)...`);
@@ -176,24 +185,32 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     return null;
   }
 
-  // Verifica se o produto existe pelo Hiper ID (metafield)
-  let produtoAtual = produtoExistente;
-  if (!produtoAtual) {
-    produtoAtual = await buscarProdutoPorHiperId(token, produtoHiper.id);
-  }
+  // 1. Busca pelo Hiper ID (metafield)
+  let produtoAtual = await buscarProdutoPorHiperId(token, produtoHiper.id);
 
-  // Se não encontrou pelo Hiper ID, tenta pelo SKU (fallback)
+  // 2. Se não encontrou pelo ID, busca por SKU
   if (!produtoAtual) {
     produtoAtual = await buscarProdutoNaShopifyPorSKU(token, sku);
+    // Se encontrou por SKU, verifica se tem metafield
+    if (produtoAtual) {
+      const temMetafield = produtoTemMetafieldHiper(produtoAtual);
+      if (!temMetafield) {
+        // Produto legado (sem metafield) → arquivar e criar novo
+        console.log(`📦 Produto "${produtoHiper.nome}" encontrado por SKU, mas sem metafield. Arquivando e criando novo...`);
+        await arquivarProdutoShopify(token, produtoAtual.id);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        return criarProdutoShopify(token, produtoHiper);
+      }
+    }
   }
 
-  // Se ainda não encontrou, cria um novo
+  // 3. Se ainda não encontrou, cria novo
   if (!produtoAtual) {
     console.log(`🆕 Produto não encontrado. Criando novo...`);
     return criarProdutoShopify(token, produtoHiper);
   }
 
-  // Remove a Default Title se existir
+  // 4. Remove a Default Title se existir
   let produtoProcessado = produtoAtual;
   const defaultVariant = produtoAtual.variants.find(v => v.title === 'Default Title');
   if (defaultVariant) {
@@ -208,7 +225,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       await request(opcoes);
       console.log(`✅ "Default Title" excluída.`);
       await new Promise(resolve => setTimeout(resolve, 1000));
-      // Recarrega o produto
       const recarregado = await buscarProdutoPorHiperId(token, produtoHiper.id) || 
                           await buscarProdutoNaShopifyPorSKU(token, sku);
       if (recarregado) {
@@ -223,7 +239,7 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   }
 
-  // Monta a atualização
+  // 5. Monta a atualização
   const mapaExistente = {};
   produtoProcessado.variants.forEach(v => { mapaExistente[v.sku] = v; });
 
