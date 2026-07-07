@@ -116,7 +116,7 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// FUNÇÃO DE DIAGNÓSTICO DETALHADO
+// FUNÇÃO DE DIAGNÓSTICO DETALHADO (ATUALIZADA)
 // ============================================================
 async function diagnosticarProduto(token, produtoHiper, produtoExistente) {
   console.log(`\n🔍 DIAGNÓSTICO PARA "${produtoHiper.nome}":`);
@@ -131,12 +131,13 @@ async function diagnosticarProduto(token, produtoHiper, produtoExistente) {
     produtoExistente.variants.forEach(v => {
       console.log(`      - SKU: ${v.sku || 'N/A'}, Título: ${v.title}, ID: ${v.id}`);
     });
-  const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title');
-if (defaultVariant) {
-  console.log(`  - ⚠️ DEFAULT TITLE encontrada! ID: ${defaultVariant.id}, SKU: ${defaultVariant.sku || 'N/A'}`);
-} else {
-  console.log(`  - ✅ Nenhuma "Default Title" encontrada.`);
-}
+    // CORREÇÃO: busca por qualquer variante com título "Default Title"
+    const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title');
+    if (defaultVariant) {
+      console.log(`  - ⚠️ DEFAULT TITLE encontrada! ID: ${defaultVariant.id}, SKU: ${defaultVariant.sku || 'N/A'}`);
+    } else {
+      console.log(`  - ✅ Nenhuma "Default Title" encontrada.`);
+    }
   } else {
     console.log(`  - Produto NÃO existe na Shopify.`);
   }
@@ -144,7 +145,7 @@ if (defaultVariant) {
 }
 
 // ============================================================
-// FUNÇÃO ATUALIZAR PRODUTO (COM RECRIAÇÃO SE NECESSÁRIO)
+// FUNÇÃO ATUALIZAR PRODUTO (COM CORREÇÃO DA DEFAULT TITLE)
 // ============================================================
 async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e estoque)...`);
@@ -156,17 +157,17 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   const sku = produtoHiper.codigoDeBarras || 
               (temVariacoes ? produtoHiper.variacao[0].codigoDeBarras : '');
 
-  // Se não tem SKU, não tem como identificar o produto
   if (!sku) {
     console.error(`❌ Produto "${produtoHiper.nome}" sem SKU. Ignorando.`);
     return null;
   }
 
-  // 2. Se existe a "Default Title", tenta excluir
+  // 2. CORREÇÃO: busca por QUALQUER variante com título "Default Title"
+  const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title');
   let produtoAtualizado = produtoExistente;
-  const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title' && !v.sku);
+
   if (defaultVariant) {
-    console.log(`🔁 Tentando excluir "Default Title" (ID: ${defaultVariant.id})...`);
+    console.log(`🔁 Tentando excluir "Default Title" (ID: ${defaultVariant.id}, SKU: ${defaultVariant.sku || 'N/A'})...`);
     try {
       const opcoes = {
         hostname: `${CONFIG.shopify.loja}.myshopify.com`,
@@ -176,9 +177,7 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       };
       await request(opcoes);
       console.log(`✅ "Default Title" excluída.`);
-      // Aguarda 1 segundo para propagar
       await new Promise(resolve => setTimeout(resolve, 1000));
-      // Recarrega o produto atualizado
       const recarregado = await buscarProdutoNaShopifyPorSKU(token, sku);
       if (recarregado) {
         produtoAtualizado = recarregado;
@@ -187,7 +186,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     } catch (erro) {
       console.warn(`⚠️ Erro ao excluir "Default Title": ${erro.message}`);
       console.log(`🔄 Tentando recriar o produto do zero...`);
-      // Se falhou, recria o produto
       const excluido = await excluirProdutoShopify(token, produtoExistente.id);
       if (excluido) {
         await new Promise(resolve => setTimeout(resolve, 1500));
@@ -199,7 +197,7 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   }
 
-  // 3. Monta a lista de variantes atualizada
+  // 3. Monta a lista de variantes
   const mapaExistente = {};
   produtoAtualizado.variants.forEach(v => { mapaExistente[v.sku] = v; });
 
@@ -226,7 +224,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       }
     });
   } else {
-    // Produto sem variações
     const existente = mapaExistente[sku];
     if (existente) {
       variantsAtualizados.push({
@@ -271,7 +268,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     const res = await request(opcoes, JSON.stringify(atualizacao));
     if (res.errors) {
       console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${JSON.stringify(res.errors)}`);
-      // Se ainda falhar, tenta recriar
       console.log(`🔄 Tentando recriar o produto do zero...`);
       const excluido = await excluirProdutoShopify(token, produtoAtualizado.id);
       if (excluido) {
