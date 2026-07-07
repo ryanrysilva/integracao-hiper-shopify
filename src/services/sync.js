@@ -21,6 +21,85 @@ if (fs.existsSync('state.json')) {
   }
 }
 
+// ============================================================
+// FUNÇÃO PARA BUSCAR PRODUTO PELO METAFIELD (via GraphQL)
+// ============================================================
+async function buscarProdutoPorMetafield(token, hiperId) {
+  console.log(`🔍 Buscando produto pelo metafield: hiper.product_id = ${hiperId}`);
+  const query = `{
+    products(first: 1, query: "metafield_namespace:hiper AND metafield_key:product_id AND metafield_value:${hiperId}") {
+      edges {
+        node {
+          id
+          title
+          metafields(first: 10) {
+            edges {
+              node {
+                namespace
+                key
+                value
+              }
+            }
+          }
+          variants(first: 50) {
+            edges {
+              node {
+                id
+                title
+                sku
+                price
+                inventoryQuantity
+                inventoryItem {
+                  id
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }`;
+
+  const request = require('../utils/request.js');
+  const opcoes = {
+    hostname: `${process.env.SHOPIFY_STORE}.myshopify.com`,
+    path: '/admin/api/2026-07/graphql.json',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': token
+    }
+  };
+
+  try {
+    const res = await request(opcoes, JSON.stringify({ query }));
+    if (res.errors) throw new Error(JSON.stringify(res.errors));
+    const edges = res.data?.products?.edges || [];
+    if (edges.length === 0) return null;
+    const product = edges[0].node;
+    return {
+      id: product.id.replace('gid://shopify/Product/', ''),
+      title: product.title,
+      variants: product.variants.edges.map(edge => ({
+        id: edge.node.id.replace('gid://shopify/ProductVariant/', ''),
+        title: edge.node.title,
+        sku: edge.node.sku,
+        price: edge.node.price,
+        inventory_quantity: edge.node.inventoryQuantity,
+        inventory_item_id: edge.node.inventoryItem?.id?.replace('gid://shopify/InventoryItem/', '')
+      })),
+      metafields: product.metafields.edges.map(edge => ({
+        namespace: edge.node.namespace,
+        key: edge.node.key,
+        value: edge.node.value
+      }))
+    };
+  } catch (err) {
+    console.error(`❌ Erro ao buscar metafield ${hiperId}:`, err.message);
+    return null;
+  }
+}
+
 async function sincronizar() {
   console.log('\n🚀 INICIANDO SINCRONIZAÇÃO COMPLETA (PRODUTOS + PEDIDOS)...\n');
   
@@ -78,7 +157,12 @@ async function sincronizar() {
       if (!sku) continue;
 
       try {
-        const existe = await buscarProdutoPorSKU(tokenShopify, sku);
+        // Busca pelo metafield primeiro
+        let existe = await buscarProdutoPorMetafield(tokenShopify, produto.id);
+        if (!existe) {
+          // Fallback: busca por SKU
+          existe = await buscarProdutoPorSKU(tokenShopify, sku);
+        }
         if (existe) {
           const temMetafield = existe.metafields && existe.metafields.some(mf => 
             mf.namespace === 'hiper' && mf.key === 'product_id'
@@ -116,7 +200,13 @@ async function sincronizar() {
           continue;
         }
 
-        const existe = await buscarProdutoPorSKU(tokenShopify, sku);
+        // 1. Busca pelo metafield (ID do Hiper)
+        let existe = await buscarProdutoPorMetafield(tokenShopify, produto.id);
+
+        // 2. Se não encontrou, busca por SKU (fallback)
+        if (!existe) {
+          existe = await buscarProdutoPorSKU(tokenShopify, sku);
+        }
 
         if (existe) {
           console.log(`📦 Produto "${produto.nome}" encontrado (SKU: ${sku}). Atualizando...`);
