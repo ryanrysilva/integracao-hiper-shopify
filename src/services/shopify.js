@@ -22,7 +22,7 @@ function gerarTokenShopify() {
 }
 
 // ============================================================
-// BUSCA PRODUTO POR METAFIELD (ID DO HIPER) - ÚNICO MÉTODO
+// BUSCA PRODUTO POR METAFIELD (ID DO HIPER)
 // ============================================================
 function buscarProdutoPorHiperId(token, hiperId) {
   const query = `metafields.owner_type:Product AND metafields.namespace:hiper AND metafields.key:product_id AND metafields.value:${hiperId}`;
@@ -36,6 +36,33 @@ function buscarProdutoPorHiperId(token, hiperId) {
     if (res.errors) throw new Error(JSON.stringify(res.errors));
     return res.products && res.products.length > 0 ? res.products[0] : null;
   });
+}
+
+// ============================================================
+// BUSCA PRODUTO POR SKU (FALLBACK SEGURO)
+// ============================================================
+function buscarProdutoNaShopifyPorSKU(token, sku) {
+  if (!sku) return Promise.resolve(null);
+  const opcoes = {
+    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+    path: `/admin/api/2026-07/products.json?sku=${encodeURIComponent(sku)}`,
+    method: 'GET',
+    headers: { 'X-Shopify-Access-Token': token }
+  };
+  return request(opcoes).then(res => {
+    if (res.errors) throw new Error(JSON.stringify(res.errors));
+    return res.products && res.products.length > 0 ? res.products[0] : null;
+  });
+}
+
+// ============================================================
+// VERIFICA SE PRODUTO TEM METAFIELD DO HIPER
+// ============================================================
+function produtoTemMetafieldHiper(produto) {
+  if (!produto || !produto.metafields) return false;
+  return produto.metafields.some(mf => 
+    mf.namespace === 'hiper' && mf.key === 'product_id'
+  );
 }
 
 // ============================================================
@@ -145,29 +172,53 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// ATUALIZAR PRODUTO (APENAS POR METAFIELD)
+// ATUALIZAR PRODUTO (COM VERIFICAÇÃO DE METAFIELD)
 // ============================================================
 async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e estoque)...`);
 
-  // 1. Busca pelo Hiper ID (metafield) - SEM FALLBACK POR SKU
+  const temVariacoes = produtoHiper.variacao && produtoHiper.variacao.length > 0;
+  const sku = produtoHiper.codigoDeBarras || 
+              (temVariacoes ? produtoHiper.variacao[0].codigoDeBarras : '');
+
+  if (!sku) {
+    console.error(`❌ Produto "${produtoHiper.nome}" sem SKU. Ignorando.`);
+    return null;
+  }
+
+  // 1. Busca pelo Hiper ID (metafield)
   let produtoAtual = await buscarProdutoPorHiperId(token, produtoHiper.id);
 
-  // 2. Se não encontrou, cria novo
+  // 2. Se não encontrou pelo ID, busca por SKU
   if (!produtoAtual) {
-    console.log(`🆕 Produto "${produtoHiper.nome}" não encontrado. Criando novo...`);
+    produtoAtual = await buscarProdutoNaShopifyPorSKU(token, sku);
+    if (produtoAtual) {
+      const temMetafield = produtoTemMetafieldHiper(produtoAtual);
+      if (!temMetafield) {
+        // Produto sem metafield → arquivar e criar novo
+        console.log(`📦 Produto "${produtoHiper.nome}" encontrado por SKU, mas sem metafield. Arquivando e criando novo...`);
+        await arquivarProdutoShopify(token, produtoAtual.id);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        return criarProdutoShopify(token, produtoHiper);
+      }
+    }
+  }
+
+  // 3. Se ainda não encontrou, cria novo
+  if (!produtoAtual) {
+    console.log(`🆕 Produto não encontrado. Criando novo...`);
     return criarProdutoShopify(token, produtoHiper);
   }
 
-  // 3. Verifica se o produto tem variantes válidas
-  if (!produtoAtual.variants || !Array.isArray(produtoAtual.variants)) {
+  // 4. Verifica se o produto tem variantes válidas
+  if (!produtoAtual.variants || !Array.isArray(produtoAtual.variants) || produtoAtual.variants.length === 0) {
     console.warn(`⚠️ Produto "${produtoHiper.nome}" não tem variantes válidas. Recriando...`);
     await arquivarProdutoShopify(token, produtoAtual.id);
     await new Promise(resolve => setTimeout(resolve, 1500));
     return criarProdutoShopify(token, produtoHiper);
   }
 
-  // 4. Remove a Default Title se existir
+  // 5. Remove a Default Title se existir
   let produtoProcessado = produtoAtual;
   const defaultVariant = produtoAtual.variants.find(v => v.title === 'Default Title');
   if (defaultVariant) {
@@ -195,15 +246,11 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   }
 
-  // 5. Monta a atualização
+  // 6. Monta a atualização
   const mapaExistente = {};
   if (produtoProcessado.variants && Array.isArray(produtoProcessado.variants)) {
     produtoProcessado.variants.forEach(v => { mapaExistente[v.sku] = v; });
   }
-
-  const temVariacoes = produtoHiper.variacao && produtoHiper.variacao.length > 0;
-  const sku = produtoHiper.codigoDeBarras || 
-              (temVariacoes ? produtoHiper.variacao[0].codigoDeBarras : '');
 
   let variantsAtualizados = [];
 
@@ -318,6 +365,7 @@ function buscarPedidosShopify(token, sinceId = 0) {
 module.exports = {
   gerarTokenShopify,
   buscarProdutoPorHiperId,
+  buscarProdutoNaShopifyPorSKU,
   criarProdutoShopify,
   atualizarProdutoShopify,
   buscarPedidosShopify
