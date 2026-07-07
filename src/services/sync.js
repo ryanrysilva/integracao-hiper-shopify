@@ -1,7 +1,7 @@
 // src/services/sync.js
 const fs = require('fs');
 const { gerarTokenHiper, buscarProdutosHiper, enviarPedidoParaHiper, consultarPedidoHiper, cancelarPedidoHiper } = require('./hiper.js');
-const { gerarTokenShopify, buscarProdutoNaShopifyPorSKU, criarProdutoShopify, atualizarProdutoShopify, buscarPedidosShopify } = require('./shopify.js');
+const { gerarTokenShopify, buscarProdutoPorHiperId, criarProdutoShopify, atualizarProdutoShopify, buscarPedidosShopify } = require('./shopify.js');
 
 let ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
 if (fs.existsSync('state.json')) {
@@ -43,6 +43,7 @@ async function sincronizar() {
       console.log(`✅ ${produtos.length} produtos encontrados no Hiper.`);
     }
 
+    // Constrói mapa SKU -> ID Hiper (para pedidos)
     const mapaSkuHiper = {};
     for (const produto of produtos) {
       if (produto.variacao && produto.variacao.length > 0) {
@@ -60,23 +61,18 @@ async function sincronizar() {
       if (produto.produtoPrimarioId && produto.produtoPrimarioId !== '00000000-0000-0000-0000-000000000000') continue;
 
       try {
-        const sku = produto.variacao && produto.variacao.length > 0 
-          ? produto.variacao[0].codigoDeBarras 
-          : produto.codigoDeBarras;
+        // 1. Busca produto pelo metafield (ID do Hiper)
+        let existe = await buscarProdutoPorHiperId(tokenShopify, produto.id);
 
-        if (!sku) {
-          console.warn(`⚠️ Produto "${produto.nome}" sem SKU, ignorando...`);
-          continue;
-        }
-
-        const existe = await buscarProdutoNaShopifyPorSKU(tokenShopify, sku);
-
-        if (existe) {
-          const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe);
-          if (atualizado) atualizados++;
-        } else {
+        // 2. Se não encontrou, cria novo
+        if (!existe) {
+          console.log(`🆕 Produto "${produto.nome}" não encontrado. Criando...`);
           await criarProdutoShopify(tokenShopify, produto);
           criados++;
+        } else {
+          // 3. Se encontrou, atualiza
+          const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe);
+          if (atualizado) atualizados++;
         }
 
       } catch (erro) {
@@ -99,6 +95,7 @@ async function sincronizar() {
     console.log(`📦 ${criados} produtos CRIADOS.`);
     console.log(`🔄 ${atualizados} produtos ATUALIZADOS.`);
 
+    // --- PEDIDOS ---
     const pedidos = await buscarPedidosShopify(tokenShopify, ESTADO.ultimoPedidoId || 0);
     let enviados = 0;
     const pedidosEnviados = [];
