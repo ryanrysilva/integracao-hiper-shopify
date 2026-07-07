@@ -10,14 +10,23 @@ const {
   buscarPedidosShopify
 } = require('./shopify.js');
 
-let ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
+// ============================================================
+// CARREGAR ESTADO (com mapaSkuHiper persistente)
+// ============================================================
+let ESTADO = { 
+  ultimoPedidoId: 0, 
+  pontoDeSincronizacao: 0,
+  mapaSkuHiper: {} // <-- NOVO: mapa cumulativo SKU -> ID do Hiper
+};
+
 if (fs.existsSync('state.json')) {
   try {
-    ESTADO = JSON.parse(fs.readFileSync('state.json', 'utf8'));
-    if (isNaN(ESTADO.pontoDeSincronizacao) || ESTADO.pontoDeSincronizacao < 0) ESTADO.pontoDeSincronizacao = 0;
+    const dados = JSON.parse(fs.readFileSync('state.json', 'utf8'));
+    ESTADO.ultimoPedidoId = dados.ultimoPedidoId || 0;
+    ESTADO.pontoDeSincronizacao = dados.pontoDeSincronizacao || 0;
+    ESTADO.mapaSkuHiper = dados.mapaSkuHiper || {};
   } catch (e) {
     console.warn('⚠️ state.json corrompido, resetando...');
-    ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
   }
 }
 
@@ -27,7 +36,6 @@ if (fs.existsSync('state.json')) {
 async function buscarProdutoPorMetafield(token, hiperId) {
   console.log(`🔍 Buscando produto pelo metafield: hiper.product_id = ${hiperId}`);
   
-  // Query corrigida: metafields.<namespace>.<key>:<value> e valor entre aspas simples
   const query = `{
     products(first: 1, query: "metafields.hiper.product_id:'${hiperId}'") {
       edges {
@@ -86,7 +94,7 @@ async function buscarProdutoPorMetafield(token, hiperId) {
       value: edge.node.value
     }));
 
-    // ✅ VALIDAÇÃO EXTRA: confirma se o metafield realmente corresponde ao hiperId buscado
+    // Validação extra para garantir que o metafield bate com o hiperId
     const metafieldConfere = metafields.some(
       mf => mf.namespace === 'hiper' && mf.key === 'product_id' && mf.value === hiperId
     );
@@ -115,6 +123,184 @@ async function buscarProdutoPorMetafield(token, hiperId) {
 }
 
 // ============================================================
+// FUNÇÃO PARA OBTER IBGE A PARTIR DO CEP (VIA ViaCEP)
+// ============================================================
+async function obterIbgePorCep(cep) {
+  if (!cep || cep.length < 8) return null;
+  try {
+    const https = require('https');
+    const url = `https://viacep.com.br/ws/${cep}/json/`;
+    return new Promise((resolve, reject) => {
+      https.get(url, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.ibge) {
+              resolve(parseInt(parsed.ibge));
+            } else {
+              resolve(null);
+            }
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }).on('error', reject);
+    });
+  } catch (e) {
+    console.warn(`⚠️ Erro ao buscar IBGE para CEP ${cep}:`, e.message);
+    return null;
+  }
+}
+
+// ============================================================
+// FUNÇÃO PARA PROCESSAR UM PEDIDO (com correções)
+// ============================================================
+async function processarPedido(tokenHiper, pedidoShopify, mapaSkuHiperCompleto) {
+  console.log(`🔄 Enviando pedido #${pedidoShopify.order_number} para o Hiper...`);
+
+  // 1. Cliente: tenta obter CPF do note_attributes
+  let documento = '00000000000'; // fallback
+  if (pedidoShopify.note_attributes) {
+    const cpfAttr = pedidoShopify.note_attributes.find(a => a.name === 'cpf' || a.name === 'documento');
+    if (cpfAttr) documento = cpfAttr.value.replace(/\D/g, '');
+  }
+  // Se ainda não tem, tenta obter do customer (alguns apps salvam como metafield)
+  if (documento === '00000000000' && pedidoShopify.customer) {
+    // Você pode buscar metafields do cliente aqui se necessário
+  }
+
+  const cliente = {
+    documento: documento,
+    email: pedidoShopify.email || pedidoShopify.customer?.email || 'cliente@email.com',
+    inscricaoEstadual: '',
+    nomeDoCliente: pedidoShopify.customer?.first_name + ' ' + pedidoShopify.customer?.last_name || 'Cliente',
+    nomeFantasia: ''
+  };
+
+  // 2. Endereço de entrega (com IBGE via CEP)
+  const shipping = pedidoShopify.shipping_address || {};
+  const cep = (shipping.zip || '').replace(/\D/g, '');
+  let codigoIbge = 0;
+  if (cep.length === 8) {
+    const ibge = await obterIbgePorCep(cep);
+    if (ibge) codigoIbge = ibge;
+  }
+
+  const enderecoEntrega = {
+    bairro: shipping.city || '',
+    cep: cep,
+    codigoIbge: codigoIbge,
+    complemento: shipping.address2 || '',
+    logradouro: shipping.address1 || '',
+    numero: shipping.address1?.match(/\d+/) ? shipping.address1.match(/\d+/)[0] : '0'
+  };
+
+  // 3. Endereço de cobrança (pode ser igual ao de entrega)
+  const billing = pedidoShopify.billing_address || shipping;
+  const cepCobranca = (billing.zip || '').replace(/\D/g, '');
+  let codigoIbgeCobranca = 0;
+  if (cepCobranca.length === 8) {
+    const ibge = await obterIbgePorCep(cepCobranca);
+    if (ibge) codigoIbgeCobranca = ibge;
+  }
+
+  const enderecoCobranca = {
+    bairro: billing.city || '',
+    cep: cepCobranca,
+    codigoIbge: codigoIbgeCobranca,
+    complemento: billing.address2 || '',
+    logradouro: billing.address1 || '',
+    numero: billing.address1?.match(/\d+/) ? billing.address1.match(/\d+/)[0] : '0'
+  };
+
+  // 4. Itens (usando mapaSkuHiperCompleto)
+  const itens = [];
+  for (const item of pedidoShopify.line_items || []) {
+    const sku = item.sku || '';
+    const produtoId = mapaSkuHiperCompleto[sku];
+    if (!produtoId) {
+      console.warn(`⚠️ SKU ${sku} não encontrado no mapa Hiper. Pulando item...`);
+      continue;
+    }
+    itens.push({
+      produtoId: produtoId,
+      quantidade: item.quantity || 1,
+      precoUnitarioBruto: parseFloat(item.price) || 0,
+      precoUnitarioLiquido: parseFloat(item.price) || 0
+    });
+  }
+
+  if (itens.length === 0) {
+    console.warn(`⚠️ Pedido #${pedidoShopify.order_number} não tem itens válidos. Ignorando.`);
+    return null;
+  }
+
+  // 5. Meios de Pagamento (mapeamento baseado no gateway)
+  // Mapeamento simples: se for 'credit_card' ou 'shopify_payments' → 4; 'pix' → 12; 'cash' → 1 etc.
+  const gateway = pedidoShopify.gateway || '';
+  let idMeioDePagamento = 4; // default: cartão de crédito
+  if (gateway.includes('pix') || gateway.includes('Pix')) idMeioDePagamento = 12;
+  else if (gateway.includes('boleto')) idMeioDePagamento = 1; // pode ajustar
+  else if (gateway.includes('debit')) idMeioDePagamento = 5;
+
+  const total = parseFloat(pedidoShopify.total_price) || 0;
+  const meiosPagamento = [{
+    idMeioDePagamento: idMeioDePagamento,
+    parcelas: 1,
+    valor: total
+  }];
+
+  // 6. Frete
+  let valorFrete = 0;
+  if (pedidoShopify.shipping_lines && pedidoShopify.shipping_lines.length > 0) {
+    valorFrete = parseFloat(pedidoShopify.shipping_lines[0].price) || 0;
+  }
+
+  // 7. Marketplace (opcional – só enviar se a loja for de SC)
+  // Você pode obter o estado da filial via configuração (ex: variável de ambiente)
+  const estadoLoja = process.env.LOJA_ESTADO || 'SP';
+  const marketplace = estadoLoja === 'SC' ? {
+    Cnpj: process.env.MARKETPLACE_CNPJ || '12605982000124',
+    Nome: process.env.MARKETPLACE_NOME || 'Hiper'
+  } : undefined;
+
+  const payloadHiper = {
+    cliente,
+    enderecoDeCobranca,
+    enderecoDeEntrega,
+    itens,
+    meiosDePagamento,
+    numeroPedidoDeVenda: pedidoShopify.order_number.toString(),
+    observacaoDoPedidoDeVenda: `Pedido Shopify #${pedidoShopify.order_number}`,
+    valorDoFrete: valorFrete
+  };
+
+  if (marketplace) {
+    payloadHiper.Marketplace = marketplace;
+  }
+
+  // 8. Envia para o Hiper
+  const opcoes = {
+    hostname: 'ms-ecommerce.hiper.com.br',
+    path: '/api/v1/pedido-de-venda/',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${tokenHiper}`
+    }
+  };
+
+  const request = require('../utils/request.js');
+  return request(opcoes, JSON.stringify(payloadHiper)).then(res => {
+    if (res.errors && res.errors.length > 0) throw new Error(res.errors.join(', '));
+    console.log(`✅ Pedido #${pedidoShopify.order_number} enviado para o Hiper! ID: ${res.id}`);
+    return { id: res.id, orderNumber: pedidoShopify.order_number };
+  });
+}
+
+// ============================================================
 // FUNÇÃO PRINCIPAL DE SINCRONIZAÇÃO
 // ============================================================
 async function sincronizar() {
@@ -124,6 +310,7 @@ async function sincronizar() {
     const tokenHiper = await gerarTokenHiper();
     const tokenShopify = await gerarTokenShopify();
 
+    // --- PRODUTOS ---
     let produtos = [];
     let ponto = 0;
     let pontoOriginal = ESTADO.pontoDeSincronizacao;
@@ -146,22 +333,27 @@ async function sincronizar() {
       console.log(`✅ ${produtos.length} produtos encontrados no Hiper.`);
     }
 
-    // Constrói mapa SKU -> ID Hiper (para pedidos)
-    const mapaSkuHiper = {};
+    // --- ATUALIZA MAPA SKU (MERGE CUMULATIVO) ---
+    const mapaNovo = {};
     for (const produto of produtos) {
       if (produto.variacao && produto.variacao.length > 0) {
-        produto.variacao.forEach(v => { if (v.codigoDeBarras) mapaSkuHiper[v.codigoDeBarras] = v.id; });
+        produto.variacao.forEach(v => {
+          if (v.codigoDeBarras) mapaNovo[v.codigoDeBarras] = v.id;
+        });
       } else {
-        if (produto.codigoDeBarras) mapaSkuHiper[produto.codigoDeBarras] = produto.id;
+        if (produto.codigoDeBarras) mapaNovo[produto.codigoDeBarras] = produto.id;
       }
     }
+    // Merge: adiciona/atualiza sem perder os que já existiam
+    ESTADO.mapaSkuHiper = { ...ESTADO.mapaSkuHiper, ...mapaNovo };
+    const mapaSkuHiperCompleto = ESTADO.mapaSkuHiper;
 
     let criados = 0;
     let atualizados = 0;
     let arquivados = 0;
     const skusProcessados = new Set();
 
-    // Primeiro: arquiva produtos antigos sem metafield (limpeza)
+    // Limpeza de produtos antigos (sem metafield)
     console.log('\n🧹 Verificando produtos existentes para evitar duplicatas...');
     for (const produto of produtos) {
       if (produto.removido || !produto.ativo) continue;
@@ -194,7 +386,7 @@ async function sincronizar() {
       }
     }
 
-    // Segundo: cria ou atualiza produtos
+    // Criação/Atualização de produtos
     console.log('\n🚀 Criando/atualizando produtos...');
     for (const produto of produtos) {
       if (produto.removido || !produto.ativo) continue;
@@ -255,6 +447,7 @@ async function sincronizar() {
       }
     }
 
+    // Atualiza ponto de sincronização apenas se houver mudanças
     if (produtos.length > 0 && (criados > 0 || atualizados > 0 || arquivados > 0)) {
       if (ponto && !isNaN(ponto) && ponto >= 0 && ponto > ESTADO.pontoDeSincronizacao) {
         ESTADO.pontoDeSincronizacao = ponto;
@@ -271,16 +464,16 @@ async function sincronizar() {
     console.log(`🔄 ${atualizados} produtos ATUALIZADOS.`);
     console.log(`📦 ${arquivados} produtos ARQUIVADOS (antigos).`);
 
-    // --- PEDIDOS ---
+    // --- PEDIDOS (usando mapaSkuHiperCompleto) ---
     const pedidos = await buscarPedidosShopify(tokenShopify, ESTADO.ultimoPedidoId || 0);
     let enviados = 0;
     const pedidosEnviados = [];
     for (const pedido of pedidos) {
       try {
-        const resultado = await enviarPedidoParaHiper(tokenHiper, pedido, mapaSkuHiper);
+        const resultado = await processarPedido(tokenHiper, pedido, mapaSkuHiperCompleto);
         if (resultado) {
           enviados++;
-          pedidosEnviados.push({ orderNumber: pedido.order_number, hiperId: resultado.id });
+          pedidosEnviados.push(resultado);
         }
         if (pedido.id > ESTADO.ultimoPedidoId) ESTADO.ultimoPedidoId = pedido.id;
       } catch (erro) {
@@ -302,11 +495,13 @@ async function sincronizar() {
       }
     }
 
+    // Salva estado (incluindo mapaSkuHiper)
     fs.writeFileSync('state.json', JSON.stringify(ESTADO, null, 2));
-    console.log(`\n✅ ESTADO SALVO.`);
+    console.log(`\n✅ ESTADO SALVO (com mapa de ${Object.keys(ESTADO.mapaSkuHiper).length} SKUs).`);
 
   } catch (erro) {
     console.error('❌ ERRO NA SINCRONIZAÇÃO:', erro.message);
+    // Aqui você pode adicionar um webhook para notificar erro (Slack, Discord, etc.)
   }
 }
 
