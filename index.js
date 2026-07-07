@@ -5,9 +5,7 @@ const fs = require('fs');
 // CARREGAR CONFIGURAÇÕES DAS VARIÁVEIS DE AMBIENTE
 // ============================================================
 const CONFIG = {
-  hiper: {
-    chave: process.env.HIPER_CHAVE
-  },
+  hiper: { chave: process.env.HIPER_CHAVE },
   shopify: {
     loja: process.env.SHOPIFY_STORE,
     client_id: process.env.SHOPIFY_CLIENT_ID,
@@ -17,29 +15,20 @@ const CONFIG = {
 
 if (!CONFIG.hiper.chave || !CONFIG.shopify.loja || !CONFIG.shopify.client_id || !CONFIG.shopify.client_secret) {
   console.error('❌ Erro: Variáveis de ambiente não configuradas!');
-  console.error('   Defina: HIPER_CHAVE, SHOPIFY_STORE, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET');
   process.exit(1);
 }
 
-// ============================================================
-// ESTADO
-// ============================================================
 let ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
 if (fs.existsSync('state.json')) {
   try {
     ESTADO = JSON.parse(fs.readFileSync('state.json', 'utf8'));
-    if (isNaN(ESTADO.pontoDeSincronizacao) || ESTADO.pontoDeSincronizacao < 0) {
-      ESTADO.pontoDeSincronizacao = 0;
-    }
+    if (isNaN(ESTADO.pontoDeSincronizacao) || ESTADO.pontoDeSincronizacao < 0) ESTADO.pontoDeSincronizacao = 0;
   } catch (e) {
     console.warn('⚠️ state.json corrompido, resetando...');
     ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
   }
 }
 
-// ============================================================
-// FUNÇÃO HTTP GENÉRICA
-// ============================================================
 function request(opcoes, dados = null) {
   return new Promise((resolve, reject) => {
     const req = https.request(opcoes, (res) => {
@@ -59,9 +48,6 @@ function request(opcoes, dados = null) {
   });
 }
 
-// ============================================================
-// 1. GERAR TOKENS
-// ============================================================
 function gerarTokenHiper() {
   console.log('🔄 Gerando token do Hiper...');
   const opcoes = {
@@ -95,9 +81,6 @@ function gerarTokenShopify() {
   });
 }
 
-// ============================================================
-// 2. PRODUTOS
-// ============================================================
 function buscarProdutosHiper(token, pontoSinc) {
   console.log(`🔄 Buscando produtos do Hiper (ponto: ${pontoSinc})...`);
   const opcoes = {
@@ -107,9 +90,7 @@ function buscarProdutosHiper(token, pontoSinc) {
     headers: { 'Authorization': `Bearer ${token}` }
   };
   return request(opcoes).then(res => {
-    if (res.errors && res.errors.length) {
-      throw new Error(res.errors.join(', '));
-    }
+    if (res.errors && res.errors.length) throw new Error(res.errors.join(', '));
     console.log(`✅ ${res.produtos?.length || 0} produtos encontrados no Hiper`);
     return res;
   });
@@ -130,12 +111,8 @@ function buscarProdutoNaShopifyPorSKU(token, sku) {
 
 function criarProdutoShopify(token, produtoHiper) {
   console.log(`🔄 CRIANDO produto "${produtoHiper.nome}" na Shopify...`);
-  
   let sku = produtoHiper.codigoDeBarras || '';
-  if (!sku) {
-    sku = `SKU-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    console.warn(`⚠️ Produto "${produtoHiper.nome}" sem SKU. Gerado: ${sku}`);
-  }
+  if (!sku) sku = `SKU-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
   const produtoShopify = {
     product: {
@@ -197,12 +174,11 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// FUNÇÃO ATUALIZAR PRODUTO (SEM EXCLUSÃO, APENAS SUBSTITUI A DEFAULT TITLE)
+// FUNÇÃO ATUALIZAR PRODUTO (SEM RECRIAR, APENAS LOG)
 // ============================================================
 async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e estoque)...`);
 
-  // Garante SKU
   let sku = produtoHiper.codigoDeBarras || '';
   if (!sku && produtoHiper.variacao && produtoHiper.variacao.length > 0) {
     sku = produtoHiper.variacao[0].codigoDeBarras || `SKU-${Date.now()}`;
@@ -210,18 +186,13 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     sku = `SKU-${Date.now()}`;
   }
 
-  // Mapeia variantes existentes por SKU
+  const variantsExistentes = produtoExistente.variants;
+  const defaultVariant = variantsExistentes.find(v => v.title === 'Default Title' && !v.sku);
   const mapaExistente = {};
-  produtoExistente.variants.forEach(v => {
-    mapaExistente[v.sku] = v;
-  });
+  variantsExistentes.forEach(v => { mapaExistente[v.sku] = v; });
 
-  // Identifica a variante "Default Title" (sem SKU)
-  const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title' && !v.sku);
+  let variantsAtualizados = [];
 
-  const variantsAtualizados = [];
-
-  // Caso 1: Produto com variações no Hiper
   if (produtoHiper.variacao && produtoHiper.variacao.length > 0) {
     produtoHiper.variacao.forEach(variacaoHiper => {
       const varSku = variacaoHiper.codigoDeBarras || sku;
@@ -234,7 +205,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
           inventory_quantity: Math.floor(variacaoHiper.quantidadeEmEstoque || 0)
         });
       } else {
-        // Se não existe, cria nova
         variantsAtualizados.push({
           sku: varSku,
           price: produtoHiper.preco.toString(),
@@ -243,11 +213,8 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       }
     });
   } else {
-    // Caso 2: Produto sem variações no Hiper
     const existente = mapaExistente[sku];
-
     if (existente) {
-      // Atualiza variante existente
       variantsAtualizados.push({
         id: existente.id,
         sku: sku,
@@ -255,7 +222,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
       });
     } else if (defaultVariant) {
-      // **SUBSTITUI a Default Title pela variante do Hiper (sem excluir)**
       console.log(`🔁 Substituindo "Default Title" por SKU ${sku}`);
       variantsAtualizados.push({
         id: defaultVariant.id,
@@ -264,7 +230,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
       });
     } else {
-      // Se não existe nenhuma variante, cria nova
       variantsAtualizados.push({
         sku: sku,
         price: produtoHiper.preco.toString(),
@@ -273,7 +238,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   }
 
-  // Monta a atualização
   const atualizacao = {
     product: {
       id: produtoExistente.id,
@@ -299,41 +263,16 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   try {
     const res = await request(opcoes, JSON.stringify(atualizacao));
     if (res.errors) {
-      // Se ainda houver erro, tenta recriar (fallback extremo)
-      console.warn(`⚠️ Erro na atualização: ${JSON.stringify(res.errors)}. Tentando recriar...`);
-      await excluirProdutoShopify(token, produtoExistente.id);
-      await sleep(1000);
-      return criarProdutoShopify(token, produtoHiper);
+      // NÃO RECRIA, apenas loga o erro
+      console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${JSON.stringify(res.errors)}`);
+      return null;
     }
     console.log(`✅ Produto "${produtoHiper.nome}" ATUALIZADO (preço/estoque) na Shopify!`);
     return res.product;
   } catch (erro) {
-    console.warn(`⚠️ Erro na atualização: ${erro.message}. Tentando recriar...`);
-    await excluirProdutoShopify(token, produtoExistente.id);
-    await sleep(1000);
-    return criarProdutoShopify(token, produtoHiper);
+    console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${erro.message}`);
+    return null;
   }
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function excluirProdutoShopify(token, productId) {
-  console.log(`🗑️ Excluindo produto ID ${productId}...`);
-  const opcoes = {
-    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
-    path: `/admin/api/2026-07/products/${productId}.json`,
-    method: 'DELETE',
-    headers: { 'X-Shopify-Access-Token': token }
-  };
-  return request(opcoes).then(() => {
-    console.log(`✅ Produto ${productId} excluído.`);
-    return true;
-  }).catch(() => {
-    console.warn(`⚠️ Produto ${productId} já foi excluído ou não existe.`);
-    return true;
-  });
 }
 
 // ============================================================
@@ -498,7 +437,6 @@ async function sincronizar() {
     const tokenHiper = await gerarTokenHiper();
     const tokenShopify = await gerarTokenShopify();
 
-    // --- PRODUTOS ---
     let produtos = [];
     let ponto = 0;
     let pontoOriginal = ESTADO.pontoDeSincronizacao;
@@ -516,7 +454,7 @@ async function sincronizar() {
     }
 
     if (produtos.length === 0) {
-      console.warn('⚠️ Nenhum produto encontrado. Verifique se há produtos com a flag "Loja virtual" ativada.');
+      console.warn('⚠️ Nenhum produto encontrado.');
     } else {
       console.log(`✅ ${produtos.length} produtos encontrados no Hiper.`);
     }
@@ -524,9 +462,7 @@ async function sincronizar() {
     const mapaSkuHiper = {};
     for (const produto of produtos) {
       if (produto.variacao && produto.variacao.length > 0) {
-        produto.variacao.forEach(v => {
-          if (v.codigoDeBarras) mapaSkuHiper[v.codigoDeBarras] = v.id;
-        });
+        produto.variacao.forEach(v => { if (v.codigoDeBarras) mapaSkuHiper[v.codigoDeBarras] = v.id; });
       } else {
         if (produto.codigoDeBarras) mapaSkuHiper[produto.codigoDeBarras] = produto.id;
       }
@@ -552,8 +488,8 @@ async function sincronizar() {
         const existe = await buscarProdutoNaShopifyPorSKU(tokenShopify, sku);
 
         if (existe) {
-          await atualizarProdutoShopify(tokenShopify, produto, existe);
-          atualizados++;
+          const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe);
+          if (atualizado) atualizados++;
         } else {
           await criarProdutoShopify(tokenShopify, produto);
           criados++;
@@ -572,7 +508,7 @@ async function sincronizar() {
         console.log(`📌 Ponto atual (${ESTADO.pontoDeSincronizacao}) mantido.`);
       }
     } else {
-      console.log(`📌 Nenhum produto processado com sucesso. Ponto de sincronização NÃO foi alterado.`);
+      console.log(`📌 Nenhum produto processado com sucesso. Ponto NÃO alterado.`);
     }
 
     console.log(`\n--- SINC. PRODUTOS CONCLUÍDA ---`);
@@ -581,7 +517,6 @@ async function sincronizar() {
 
     // --- PEDIDOS ---
     const pedidos = await buscarPedidosShopify(tokenShopify, ESTADO.ultimoPedidoId || 0);
-
     let enviados = 0;
     const pedidosEnviados = [];
     for (const pedido of pedidos) {
@@ -589,14 +524,9 @@ async function sincronizar() {
         const resultado = await enviarPedidoParaHiper(tokenHiper, pedido, mapaSkuHiper);
         if (resultado) {
           enviados++;
-          pedidosEnviados.push({
-            orderNumber: pedido.order_number,
-            hiperId: resultado.id
-          });
+          pedidosEnviados.push({ orderNumber: pedido.order_number, hiperId: resultado.id });
         }
-        if (pedido.id > ESTADO.ultimoPedidoId) {
-          ESTADO.ultimoPedidoId = pedido.id;
-        }
+        if (pedido.id > ESTADO.ultimoPedidoId) ESTADO.ultimoPedidoId = pedido.id;
       } catch (erro) {
         console.error(`❌ Erro ao enviar pedido #${pedido.order_number}:`, erro.message);
       }
@@ -617,20 +547,12 @@ async function sincronizar() {
     }
 
     fs.writeFileSync('state.json', JSON.stringify(ESTADO, null, 2));
-    console.log(`\n✅ ESTADO SALVO. Próxima execução não repetirá os mesmos itens.`);
+    console.log(`\n✅ ESTADO SALVO.`);
 
   } catch (erro) {
     console.error('❌ ERRO NA SINCRONIZAÇÃO:', erro.message);
   }
 }
 
-// ============================================================
-// EXPORTAR E EXECUTAR
-// ============================================================
-module.exports = {
-  sincronizar,
-  consultarPedidoHiper,
-  cancelarPedidoHiper
-};
-
+module.exports = { sincronizar, consultarPedidoHiper, cancelarPedidoHiper };
 sincronizar();
