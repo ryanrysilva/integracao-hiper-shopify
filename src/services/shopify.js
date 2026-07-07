@@ -131,12 +131,12 @@ async function diagnosticarProduto(token, produtoHiper, produtoExistente) {
     produtoExistente.variants.forEach(v => {
       console.log(`      - SKU: ${v.sku || 'N/A'}, Título: ${v.title}, ID: ${v.id}`);
     });
-    const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title' && !v.sku);
-    if (defaultVariant) {
-      console.log(`  - ⚠️ DEFAULT TITLE encontrada! ID: ${defaultVariant.id}`);
-    } else {
-      console.log(`  - ✅ Nenhuma "Default Title" encontrada.`);
-    }
+  const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title');
+if (defaultVariant) {
+  console.log(`  - ⚠️ DEFAULT TITLE encontrada! ID: ${defaultVariant.id}, SKU: ${defaultVariant.sku || 'N/A'}`);
+} else {
+  console.log(`  - ✅ Nenhuma "Default Title" encontrada.`);
+}
   } else {
     console.log(`  - Produto NÃO existe na Shopify.`);
   }
