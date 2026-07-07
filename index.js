@@ -153,6 +153,7 @@ function criarProdutoShopify(token, produtoHiper) {
     });
   } else {
     produtoShopify.product.variants.push({
+      title: 'Default Title',
       price: produtoHiper.preco.toString(),
       sku: produtoHiper.codigoDeBarras || '',
       inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
@@ -177,99 +178,80 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// FUNÇÃO PARA EXCLUIR VARIANTE POR ID
-// ============================================================
-function excluirVarianteShopify(token, variantId) {
-  console.log(`🗑️ Excluindo variante ID ${variantId}...`);
-  const opcoes = {
-    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
-    path: `/admin/api/2026-07/variants/${variantId}.json`,
-    method: 'DELETE',
-    headers: { 'X-Shopify-Access-Token': token }
-  };
-  return request(opcoes).then(res => {
-    // DELETE não retorna conteúdo em caso de sucesso
-    console.log(`✅ Variante ${variantId} excluída com sucesso.`);
-    return true;
-  });
-}
-
-// ============================================================
-// FUNÇÃO ATUALIZAR PRODUTO (COM EXCLUSÃO DA DEFAULT TITLE)
+// FUNÇÃO ATUALIZAR PRODUTO (SEM ALTERAR O TITLE)
 // ============================================================
 async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
-  console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (incluindo PREÇO e ESTOQUE)...`);
+  console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e estoque, sem alterar o nome das variantes)...`);
 
-  // Identifica a variante "Default Title" sem SKU
-  const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title' && !v.sku);
-
-  // Se existir, exclui a Default Title
-  if (defaultVariant) {
-    console.log(`🔁 Removendo "Default Title" (ID: ${defaultVariant.id})...`);
-    try {
-      await excluirVarianteShopify(token, defaultVariant.id);
-      // Aguarda 1 segundo para a exclusão ser processada
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      console.log(`✅ "Default Title" removida. Nova variante será criada.`);
-    } catch (erro) {
-      console.warn(`⚠️ Erro ao excluir Default Title: ${erro.message}. Tentando continuar...`);
-    }
-  }
-
-  // Busca o produto atualizado (após exclusão)
-  const sku = produtoHiper.codigoDeBarras || '';
-  const produtoAtualizado = await buscarProdutoNaShopifyPorSKU(token, sku);
-
-  // Se o produto foi encontrado, usamos ele para atualizar
-  let produtoFinal = produtoAtualizado || produtoExistente;
-
-  // Agora monta a atualização com as variantes corretas
+  // Mapeia variantes existentes por SKU
   const mapaExistente = {};
-  produtoFinal.variants.forEach(v => { mapaExistente[v.sku] = v; });
+  produtoExistente.variants.forEach(v => {
+    mapaExistente[v.sku] = v;
+  });
 
   let variantsAtualizados = [];
 
+  // Produto com variações no Hiper
   if (produtoHiper.variacao && produtoHiper.variacao.length > 0) {
     produtoHiper.variacao.forEach(variacaoHiper => {
-      const skuVar = variacaoHiper.codigoDeBarras || '';
-      const existente = mapaExistente[skuVar];
+      const sku = variacaoHiper.codigoDeBarras || '';
+      const existente = mapaExistente[sku];
+      
       if (existente) {
+        // Atualiza variante existente (preço e estoque, sem alterar o título)
         variantsAtualizados.push({
           id: existente.id,
-          sku: skuVar,
+          sku: sku,
           price: produtoHiper.preco.toString(),
           inventory_quantity: Math.floor(variacaoHiper.quantidadeEmEstoque || 0)
         });
       } else {
+        // Cria nova variante (caso raro)
         variantsAtualizados.push({
-          sku: skuVar,
+          sku: sku,
           price: produtoHiper.preco.toString(),
           inventory_quantity: Math.floor(variacaoHiper.quantidadeEmEstoque || 0)
         });
       }
     });
   } else {
-    const skuVar = produtoHiper.codigoDeBarras || '';
-    const existente = mapaExistente[skuVar];
+    // Produto sem variações no Hiper
+    const sku = produtoHiper.codigoDeBarras || '';
+    const existente = mapaExistente[sku];
+    
+    // Se não existe variante com esse SKU, procura a "Default Title"
+    const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title' && !v.sku);
+    
     if (existente) {
+      // Atualiza variante existente
       variantsAtualizados.push({
         id: existente.id,
-        sku: skuVar,
+        sku: sku,
+        price: produtoHiper.preco.toString(),
+        inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
+      });
+    } else if (defaultVariant) {
+      // Atualiza a Default Title com SKU, preço e estoque (sem alterar o título)
+      variantsAtualizados.push({
+        id: defaultVariant.id,
+        sku: sku,
         price: produtoHiper.preco.toString(),
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
       });
     } else {
+      // Cria nova variante
       variantsAtualizados.push({
-        sku: skuVar,
+        sku: sku,
         price: produtoHiper.preco.toString(),
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
       });
     }
   }
 
+  // Monta a atualização (sem alterar o título do produto, apenas variantes)
   const atualizacao = {
     product: {
-      id: produtoFinal.id,
+      id: produtoExistente.id,
       title: produtoHiper.nome,
       body_html: produtoHiper.descricao || '',
       vendor: produtoHiper.marca || '',
@@ -281,7 +263,7 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
 
   const opcoes = {
     hostname: `${CONFIG.shopify.loja}.myshopify.com`,
-    path: `/admin/api/2026-07/products/${produtoFinal.id}.json`,
+    path: `/admin/api/2026-07/products/${produtoExistente.id}.json`,
     method: 'PUT',
     headers: {
       'Content-Type': 'application/json',
@@ -289,10 +271,37 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   };
 
-  return request(opcoes, JSON.stringify(atualizacao)).then(res => {
-    if (res.errors) throw new Error(JSON.stringify(res.errors));
+  try {
+    const res = await request(opcoes, JSON.stringify(atualizacao));
+    if (res.errors) {
+      // Se a atualização falhar, tenta recriar o produto (exclui e cria novamente)
+      console.warn(`⚠️ Erro na atualização, tentando recriar o produto...`);
+      await excluirProdutoShopify(token, produtoExistente.id);
+      return criarProdutoShopify(token, produtoHiper);
+    }
     console.log(`✅ Produto "${produtoHiper.nome}" ATUALIZADO (preço/estoque) na Shopify!`);
     return res.product;
+  } catch (erro) {
+    console.warn(`⚠️ Erro na atualização, tentando recriar o produto...`);
+    await excluirProdutoShopify(token, produtoExistente.id);
+    return criarProdutoShopify(token, produtoHiper);
+  }
+}
+
+// ============================================================
+// FUNÇÃO EXCLUIR PRODUTO (usada como fallback)
+// ============================================================
+function excluirProdutoShopify(token, productId) {
+  console.log(`🗑️ Excluindo produto ID ${productId}...`);
+  const opcoes = {
+    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+    path: `/admin/api/2026-07/products/${productId}.json`,
+    method: 'DELETE',
+    headers: { 'X-Shopify-Access-Token': token }
+  };
+  return request(opcoes).then(res => {
+    console.log(`✅ Produto ${productId} excluído.`);
+    return true;
   });
 }
 
@@ -524,15 +533,16 @@ async function sincronizar() {
       }
     }
 
-    if (produtos.length > 0 && ponto && !isNaN(ponto) && ponto >= 0) {
-      if (ponto > ESTADO.pontoDeSincronizacao) {
+    // Atualiza ponto apenas se houver produtos processados com sucesso
+    if (produtos.length > 0 && (criados > 0 || atualizados > 0)) {
+      if (ponto && !isNaN(ponto) && ponto >= 0 && ponto > ESTADO.pontoDeSincronizacao) {
         ESTADO.pontoDeSincronizacao = ponto;
         console.log(`📌 Ponto de sincronização atualizado para ${ponto}`);
       } else {
-        console.log(`📌 Ponto atual (${ESTADO.pontoDeSincronizacao}) já é maior ou igual ao novo (${ponto}), mantendo.`);
+        console.log(`📌 Ponto atual (${ESTADO.pontoDeSincronizacao}) mantido.`);
       }
     } else {
-      console.log(`📌 Nenhum produto encontrado. Ponto de sincronização NÃO foi alterado.`);
+      console.log(`📌 Nenhum produto processado com sucesso. Ponto de sincronização NÃO foi alterado.`);
     }
 
     console.log(`\n--- SINC. PRODUTOS CONCLUÍDA ---`);
