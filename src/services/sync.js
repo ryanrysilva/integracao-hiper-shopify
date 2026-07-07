@@ -10,13 +10,10 @@ const {
   buscarPedidosShopify
 } = require('./shopify.js');
 
-// ============================================================
-// CARREGAR ESTADO (com mapaSkuHiper persistente)
-// ============================================================
 let ESTADO = { 
   ultimoPedidoId: 0, 
   pontoDeSincronizacao: 0,
-  mapaSkuHiper: {} // <-- NOVO: mapa cumulativo SKU -> ID do Hiper
+  mapaSkuHiper: {}
 };
 
 if (fs.existsSync('state.json')) {
@@ -31,13 +28,14 @@ if (fs.existsSync('state.json')) {
 }
 
 // ============================================================
-// FUNÇÃO PARA BUSCAR PRODUTO PELO METAFIELD (GRAPHQL CORRIGIDO)
+// FUNÇÃO PARA BUSCAR PRODUTO PELO METAFIELD (VERSÃO ROBUSTA)
 // ============================================================
 async function buscarProdutoPorMetafield(token, hiperId) {
   console.log(`🔍 Buscando produto pelo metafield: hiper.product_id = ${hiperId}`);
-  
+
+  // Abordagem: busca produtos com metafield namespace=hiper e key=product_id, sem filtrar pelo valor
   const query = `{
-    products(first: 1, query: "metafields.hiper.product_id:'${hiperId}'") {
+    products(first: 10, query: "metafields.hiper.product_id:*") {
       edges {
         node {
           id
@@ -85,37 +83,44 @@ async function buscarProdutoPorMetafield(token, hiperId) {
     const res = await request(opcoes, JSON.stringify({ query }));
     if (res.errors) throw new Error(JSON.stringify(res.errors));
     const edges = res.data?.products?.edges || [];
-    if (edges.length === 0) return null;
-    
-    const product = edges[0].node;
-    const metafields = product.metafields.edges.map(edge => ({
-      namespace: edge.node.namespace,
-      key: edge.node.key,
-      value: edge.node.value
-    }));
-
-    // Validação extra para garantir que o metafield bate com o hiperId
-    const metafieldConfere = metafields.some(
-      mf => mf.namespace === 'hiper' && mf.key === 'product_id' && mf.value === hiperId
-    );
-    if (!metafieldConfere) {
-      console.warn(`⚠️ Produto retornado não bate com hiperId ${hiperId}. Ignorando.`);
+    if (edges.length === 0) {
+      console.log(`ℹ️ Nenhum produto com metafield hiper.product_id encontrado.`);
       return null;
     }
 
-    return {
-      id: product.id.replace('gid://shopify/Product/', ''),
-      title: product.title,
-      variants: product.variants.edges.map(edge => ({
-        id: edge.node.id.replace('gid://shopify/ProductVariant/', ''),
-        title: edge.node.title,
-        sku: edge.node.sku,
-        price: edge.node.price,
-        inventory_quantity: edge.node.inventoryQuantity,
-        inventory_item_id: edge.node.inventoryItem?.id?.replace('gid://shopify/InventoryItem/', '')
-      })),
-      metafields
-    };
+    // Itera sobre os produtos encontrados e verifica o valor do metafield
+    for (const edge of edges) {
+      const product = edge.node;
+      const metafields = product.metafields.edges.map(edge => ({
+        namespace: edge.node.namespace,
+        key: edge.node.key,
+        value: edge.node.value
+      }));
+
+      const metafieldConfere = metafields.some(
+        mf => mf.namespace === 'hiper' && mf.key === 'product_id' && mf.value === hiperId
+      );
+
+      if (metafieldConfere) {
+        console.log(`✅ Produto encontrado pelo metafield: ${product.title} (ID: ${product.id})`);
+        return {
+          id: product.id.replace('gid://shopify/Product/', ''),
+          title: product.title,
+          variants: product.variants.edges.map(edge => ({
+            id: edge.node.id.replace('gid://shopify/ProductVariant/', ''),
+            title: edge.node.title,
+            sku: edge.node.sku,
+            price: edge.node.price,
+            inventory_quantity: edge.node.inventoryQuantity,
+            inventory_item_id: edge.node.inventoryItem?.id?.replace('gid://shopify/InventoryItem/', '')
+          })),
+          metafields
+        };
+      }
+    }
+
+    console.warn(`⚠️ Nenhum produto com metafield igual a "${hiperId}" foi encontrado.`);
+    return null;
   } catch (err) {
     console.error(`❌ Erro ao buscar metafield ${hiperId}:`, err.message);
     return null;
@@ -123,7 +128,7 @@ async function buscarProdutoPorMetafield(token, hiperId) {
 }
 
 // ============================================================
-// FUNÇÃO PARA OBTER IBGE A PARTIR DO CEP (VIA ViaCEP)
+// FUNÇÃO PARA OBTER IBGE A PARTIR DO CEP (ViaCEP)
 // ============================================================
 async function obterIbgePorCep(cep) {
   if (!cep || cep.length < 8) return null;
@@ -155,20 +160,15 @@ async function obterIbgePorCep(cep) {
 }
 
 // ============================================================
-// FUNÇÃO PARA PROCESSAR UM PEDIDO (com correções)
+// FUNÇÃO PARA PROCESSAR UM PEDIDO
 // ============================================================
 async function processarPedido(tokenHiper, pedidoShopify, mapaSkuHiperCompleto) {
   console.log(`🔄 Enviando pedido #${pedidoShopify.order_number} para o Hiper...`);
 
-  // 1. Cliente: tenta obter CPF do note_attributes
-  let documento = '00000000000'; // fallback
+  let documento = '00000000000';
   if (pedidoShopify.note_attributes) {
     const cpfAttr = pedidoShopify.note_attributes.find(a => a.name === 'cpf' || a.name === 'documento');
     if (cpfAttr) documento = cpfAttr.value.replace(/\D/g, '');
-  }
-  // Se ainda não tem, tenta obter do customer (alguns apps salvam como metafield)
-  if (documento === '00000000000' && pedidoShopify.customer) {
-    // Você pode buscar metafields do cliente aqui se necessário
   }
 
   const cliente = {
@@ -179,7 +179,6 @@ async function processarPedido(tokenHiper, pedidoShopify, mapaSkuHiperCompleto) 
     nomeFantasia: ''
   };
 
-  // 2. Endereço de entrega (com IBGE via CEP)
   const shipping = pedidoShopify.shipping_address || {};
   const cep = (shipping.zip || '').replace(/\D/g, '');
   let codigoIbge = 0;
@@ -197,7 +196,6 @@ async function processarPedido(tokenHiper, pedidoShopify, mapaSkuHiperCompleto) 
     numero: shipping.address1?.match(/\d+/) ? shipping.address1.match(/\d+/)[0] : '0'
   };
 
-  // 3. Endereço de cobrança (pode ser igual ao de entrega)
   const billing = pedidoShopify.billing_address || shipping;
   const cepCobranca = (billing.zip || '').replace(/\D/g, '');
   let codigoIbgeCobranca = 0;
@@ -215,7 +213,6 @@ async function processarPedido(tokenHiper, pedidoShopify, mapaSkuHiperCompleto) 
     numero: billing.address1?.match(/\d+/) ? billing.address1.match(/\d+/)[0] : '0'
   };
 
-  // 4. Itens (usando mapaSkuHiperCompleto)
   const itens = [];
   for (const item of pedidoShopify.line_items || []) {
     const sku = item.sku || '';
@@ -237,12 +234,10 @@ async function processarPedido(tokenHiper, pedidoShopify, mapaSkuHiperCompleto) 
     return null;
   }
 
-  // 5. Meios de Pagamento (mapeamento baseado no gateway)
-  // Mapeamento simples: se for 'credit_card' ou 'shopify_payments' → 4; 'pix' → 12; 'cash' → 1 etc.
   const gateway = pedidoShopify.gateway || '';
-  let idMeioDePagamento = 4; // default: cartão de crédito
+  let idMeioDePagamento = 4;
   if (gateway.includes('pix') || gateway.includes('Pix')) idMeioDePagamento = 12;
-  else if (gateway.includes('boleto')) idMeioDePagamento = 1; // pode ajustar
+  else if (gateway.includes('boleto')) idMeioDePagamento = 1;
   else if (gateway.includes('debit')) idMeioDePagamento = 5;
 
   const total = parseFloat(pedidoShopify.total_price) || 0;
@@ -252,14 +247,11 @@ async function processarPedido(tokenHiper, pedidoShopify, mapaSkuHiperCompleto) 
     valor: total
   }];
 
-  // 6. Frete
   let valorFrete = 0;
   if (pedidoShopify.shipping_lines && pedidoShopify.shipping_lines.length > 0) {
     valorFrete = parseFloat(pedidoShopify.shipping_lines[0].price) || 0;
   }
 
-  // 7. Marketplace (opcional – só enviar se a loja for de SC)
-  // Você pode obter o estado da filial via configuração (ex: variável de ambiente)
   const estadoLoja = process.env.LOJA_ESTADO || 'SP';
   const marketplace = estadoLoja === 'SC' ? {
     Cnpj: process.env.MARKETPLACE_CNPJ || '12605982000124',
@@ -281,7 +273,7 @@ async function processarPedido(tokenHiper, pedidoShopify, mapaSkuHiperCompleto) 
     payloadHiper.Marketplace = marketplace;
   }
 
-  // 8. Envia para o Hiper
+  const request = require('../utils/request.js');
   const opcoes = {
     hostname: 'ms-ecommerce.hiper.com.br',
     path: '/api/v1/pedido-de-venda/',
@@ -292,7 +284,6 @@ async function processarPedido(tokenHiper, pedidoShopify, mapaSkuHiperCompleto) 
     }
   };
 
-  const request = require('../utils/request.js');
   return request(opcoes, JSON.stringify(payloadHiper)).then(res => {
     if (res.errors && res.errors.length > 0) throw new Error(res.errors.join(', '));
     console.log(`✅ Pedido #${pedidoShopify.order_number} enviado para o Hiper! ID: ${res.id}`);
@@ -310,7 +301,6 @@ async function sincronizar() {
     const tokenHiper = await gerarTokenHiper();
     const tokenShopify = await gerarTokenShopify();
 
-    // --- PRODUTOS ---
     let produtos = [];
     let ponto = 0;
     let pontoOriginal = ESTADO.pontoDeSincronizacao;
@@ -333,7 +323,7 @@ async function sincronizar() {
       console.log(`✅ ${produtos.length} produtos encontrados no Hiper.`);
     }
 
-    // --- ATUALIZA MAPA SKU (MERGE CUMULATIVO) ---
+    // Atualiza mapa SKU (cumulativo)
     const mapaNovo = {};
     for (const produto of produtos) {
       if (produto.variacao && produto.variacao.length > 0) {
@@ -344,7 +334,6 @@ async function sincronizar() {
         if (produto.codigoDeBarras) mapaNovo[produto.codigoDeBarras] = produto.id;
       }
     }
-    // Merge: adiciona/atualiza sem perder os que já existiam
     ESTADO.mapaSkuHiper = { ...ESTADO.mapaSkuHiper, ...mapaNovo };
     const mapaSkuHiperCompleto = ESTADO.mapaSkuHiper;
 
@@ -447,7 +436,6 @@ async function sincronizar() {
       }
     }
 
-    // Atualiza ponto de sincronização apenas se houver mudanças
     if (produtos.length > 0 && (criados > 0 || atualizados > 0 || arquivados > 0)) {
       if (ponto && !isNaN(ponto) && ponto >= 0 && ponto > ESTADO.pontoDeSincronizacao) {
         ESTADO.pontoDeSincronizacao = ponto;
@@ -464,7 +452,7 @@ async function sincronizar() {
     console.log(`🔄 ${atualizados} produtos ATUALIZADOS.`);
     console.log(`📦 ${arquivados} produtos ARQUIVADOS (antigos).`);
 
-    // --- PEDIDOS (usando mapaSkuHiperCompleto) ---
+    // --- PEDIDOS ---
     const pedidos = await buscarPedidosShopify(tokenShopify, ESTADO.ultimoPedidoId || 0);
     let enviados = 0;
     const pedidosEnviados = [];
@@ -495,13 +483,11 @@ async function sincronizar() {
       }
     }
 
-    // Salva estado (incluindo mapaSkuHiper)
     fs.writeFileSync('state.json', JSON.stringify(ESTADO, null, 2));
     console.log(`\n✅ ESTADO SALVO (com mapa de ${Object.keys(ESTADO.mapaSkuHiper).length} SKUs).`);
 
   } catch (erro) {
     console.error('❌ ERRO NA SINCRONIZAÇÃO:', erro.message);
-    // Aqui você pode adicionar um webhook para notificar erro (Slack, Discord, etc.)
   }
 }
 
