@@ -21,36 +21,95 @@ function gerarTokenShopify() {
   });
 }
 
+// ============================================================
+// BUSCA PRODUTO POR SKU (GRAPHQL – CORRETO)
+// ============================================================
 function buscarProdutoPorSKU(token, sku) {
   if (!sku) return Promise.resolve(null);
-  console.log(`🔍 Buscando produto pelo SKU: ${sku}`);
+  console.log(`🔍 Buscando produto pelo SKU: ${sku} (via GraphQL)`);
+
+  const query = `{
+    productVariants(first: 1, query: "sku:${sku}") {
+      edges {
+        node {
+          id
+          sku
+          product {
+            id
+            title
+            metafields(first: 10) {
+              edges {
+                node {
+                  namespace
+                  key
+                  value
+                }
+              }
+            }
+            variants(first: 50) {
+              edges {
+                node {
+                  id
+                  title
+                  sku
+                  price
+                  inventoryQuantity
+                  inventoryItem {
+                    id
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }`;
+
   const opcoes = {
     hostname: `${CONFIG.shopify.loja}.myshopify.com`,
-    path: `/admin/api/2026-07/products.json?sku=${encodeURIComponent(sku)}`,
-    method: 'GET',
-    headers: { 'X-Shopify-Access-Token': token }
+    path: '/admin/api/2026-07/graphql.json',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': token
+    }
   };
-  return request(opcoes).then(res => {
-    if (res.errors) throw new Error(JSON.stringify(res.errors));
-    const product = res.products && res.products.length > 0 ? res.products[0] : null;
-    if (!product) return null;
-    const opcoesVariants = {
-      hostname: `${CONFIG.shopify.loja}.myshopify.com`,
-      path: `/admin/api/2026-07/products/${product.id}/variants.json`,
-      method: 'GET',
-      headers: { 'X-Shopify-Access-Token': token }
-    };
-    return request(opcoesVariants).then(resVariants => {
+
+  return request(opcoes, JSON.stringify({ query }))
+    .then(res => {
+      if (res.errors) throw new Error(JSON.stringify(res.errors));
+      const edges = res.data?.productVariants?.edges || [];
+      if (edges.length === 0) return null;
+      const variantNode = edges[0].node;
+      const product = variantNode.product;
       return {
-        id: product.id,
+        id: product.id.replace('gid://shopify/Product/', ''),
         title: product.title,
-        variants: resVariants.variants || [],
-        metafields: product.metafields || []
+        variants: product.variants.edges.map(edge => ({
+          id: edge.node.id.replace('gid://shopify/ProductVariant/', ''),
+          title: edge.node.title,
+          sku: edge.node.sku,
+          price: edge.node.price,
+          inventory_quantity: edge.node.inventoryQuantity,
+          inventory_item_id: edge.node.inventoryItem?.id?.replace('gid://shopify/InventoryItem/', '')
+        })),
+        metafields: product.metafields.edges.map(edge => ({
+          namespace: edge.node.namespace,
+          key: edge.node.key,
+          value: edge.node.value
+        }))
       };
+    })
+    .catch(err => {
+      console.error(`❌ Erro ao buscar SKU ${sku}:`, err.message);
+      return null;
     });
-  });
 }
 
+// ============================================================
+// ARQUIVAR PRODUTO
+// ============================================================
 function arquivarProdutoShopify(token, productId) {
   console.log(`📦 Arquivando produto ID ${productId}...`);
   const opcoes = {
@@ -73,8 +132,12 @@ function arquivarProdutoShopify(token, productId) {
   });
 }
 
+// ============================================================
+// CRIAR PRODUTO (COM METAFIELD)
+// ============================================================
 function criarProdutoShopify(token, produtoHiper) {
   console.log(`🔄 CRIANDO produto "${produtoHiper.nome}" na Shopify...`);
+  
   let sku = produtoHiper.codigoDeBarras || `SKU-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
   const hiperId = produtoHiper.id;
 
@@ -119,6 +182,7 @@ function criarProdutoShopify(token, produtoHiper) {
       }
       produtoShopify.product.variants.push(variant);
     });
+
   } else {
     produtoShopify.product.options = [{ name: 'Título' }];
     produtoShopify.product.variants.push({
@@ -148,6 +212,9 @@ function criarProdutoShopify(token, produtoHiper) {
   });
 }
 
+// ============================================================
+// ATUALIZAR ESTOQUE (VIA INVENTORY API)
+// ============================================================
 function atualizarEstoqueShopify(token, inventoryItemId, quantity, locationId = null) {
   if (!inventoryItemId) {
     console.warn('⚠️ inventoryItemId não informado. Pulando atualização de estoque.');
@@ -188,6 +255,9 @@ function atualizarEstoqueShopify(token, inventoryItemId, quantity, locationId = 
   });
 }
 
+// ============================================================
+// ATUALIZAR PRODUTO (PREÇO, OPÇÕES, E ESTOQUE VIA API SEPARADA)
+// ============================================================
 async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e opções)...`);
   if (!produtoExistente || !produtoExistente.variants || produtoExistente.variants.length === 0) {
@@ -299,6 +369,9 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   }
 }
 
+// ============================================================
+// BUSCAR PEDIDOS
+// ============================================================
 function buscarPedidosShopify(token, sinceId = 0) {
   console.log(`🔄 Buscando pedidos novos na Shopify (since_id: ${sinceId})...`);
   const path = `/admin/api/2026-07/orders.json?status=any&since_id=${sinceId}&limit=50`;
@@ -315,11 +388,14 @@ function buscarPedidosShopify(token, sinceId = 0) {
   });
 }
 
+// ============================================================
+// EXPORTAÇÕES
+// ============================================================
 module.exports = {
   gerarTokenShopify,
   buscarProdutoPorSKU,
   criarProdutoShopify,
   atualizarProdutoShopify,
-  buscarPedidosShopify,
-  arquivarProdutoShopify
+  arquivarProdutoShopify,
+  buscarPedidosShopify
 };
