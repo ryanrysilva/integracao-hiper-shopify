@@ -61,7 +61,7 @@ async function sincronizar() {
       if (produto.produtoPrimarioId && produto.produtoPrimarioId !== '00000000-0000-0000-0000-000000000000') continue;
 
       try {
-        // 1. Busca produto pelo metafield (ID do Hiper)
+        // 1. Busca produto APENAS pelo metafield (ID do Hiper)
         let existe = await buscarProdutoPorHiperId(tokenShopify, produto.id);
 
         // 2. Se não encontrou, cria novo
