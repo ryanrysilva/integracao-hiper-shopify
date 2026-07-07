@@ -99,12 +99,31 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// FUNÇÃO ATUALIZAR PRODUTO (CORRIGIDA PARA VARIAÇÕES)
+// FUNÇÃO PARA EXCLUIR UMA VARIANTE POR ID
+// ============================================================
+function excluirVarianteShopify(token, variantId) {
+  console.log(`🗑️ Excluindo variante ID ${variantId}...`);
+  const opcoes = {
+    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+    path: `/admin/api/2026-07/variants/${variantId}.json`,
+    method: 'DELETE',
+    headers: { 'X-Shopify-Access-Token': token }
+  };
+  return request(opcoes).then(() => {
+    console.log(`✅ Variante ${variantId} excluída.`);
+    return true;
+  }).catch((err) => {
+    console.warn(`⚠️ Erro ao excluir variante: ${err.message}`);
+    return false;
+  });
+}
+
+// ============================================================
+// FUNÇÃO ATUALIZAR PRODUTO (COM EXCLUSÃO DA DEFAULT TITLE)
 // ============================================================
 async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e estoque)...`);
 
-  // Se o produto tem variações no Hiper, vamos criar/atualizar todas
   const temVariacoes = produtoHiper.variacao && produtoHiper.variacao.length > 0;
 
   // Mapeia variantes existentes na Shopify por SKU
@@ -114,15 +133,35 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   // Identifica a variante "Default Title" (sem SKU)
   const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title' && !v.sku);
 
+  // Se existir "Default Title", exclui ela primeiro
+  if (defaultVariant) {
+    console.log(`🔁 Excluindo "Default Title" (ID: ${defaultVariant.id}) para substituir pelas variações do Hiper.`);
+    await excluirVarianteShopify(token, defaultVariant.id);
+    // Aguarda 1 segundo para garantir que a exclusão foi processada
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    // Recarrega o produto atualizado após a exclusão
+    const sku = produtoHiper.codigoDeBarras || 
+                (produtoHiper.variacao && produtoHiper.variacao.length > 0 ? produtoHiper.variacao[0].codigoDeBarras : '');
+    if (sku) {
+      const produtoAtualizado = await buscarProdutoNaShopifyPorSKU(token, sku);
+      if (produtoAtualizado) {
+        produtoExistente = produtoAtualizado;
+        // Atualiza o mapa com as variantes restantes
+        const novoMapa = {};
+        produtoExistente.variants.forEach(v => { novoMapa[v.sku] = v; });
+        Object.assign(mapaExistente, novoMapa);
+      }
+    }
+  }
+
+  // Se o produto tem variações no Hiper, cria/atualiza todas
   let variantsAtualizados = [];
 
   if (temVariacoes) {
-    // Caso 1: Produto COM variações no Hiper
     console.log(`🔁 Produto com ${produtoHiper.variacao.length} variações no Hiper.`);
     produtoHiper.variacao.forEach(variacaoHiper => {
       const varSku = variacaoHiper.codigoDeBarras || '';
       const existente = mapaExistente[varSku];
-      // Se a variação já existe na Shopify, atualiza. Senão, cria nova.
       if (existente) {
         variantsAtualizados.push({
           id: existente.id,
@@ -138,27 +177,13 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
         });
       }
     });
-    // Se existir a Default Title, ela será removida (não será incluída no array de variantes)
-    if (defaultVariant) {
-      console.log(`🗑️ Removendo "Default Title" porque o produto agora tem variações.`);
-      // Não a incluímos no array, então ela será deletada automaticamente pela Shopify
-    }
   } else {
-    // Caso 2: Produto SEM variações no Hiper
+    // Produto SEM variações no Hiper
     const sku = produtoHiper.codigoDeBarras || '';
     const existente = mapaExistente[sku];
-
     if (existente) {
       variantsAtualizados.push({
         id: existente.id,
-        sku: sku,
-        price: produtoHiper.preco.toString(),
-        inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
-      });
-    } else if (defaultVariant) {
-      console.log(`🔁 Substituindo "Default Title" por SKU ${sku}`);
-      variantsAtualizados.push({
-        id: defaultVariant.id,
         sku: sku,
         price: produtoHiper.preco.toString(),
         inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
@@ -198,7 +223,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   try {
     const res = await request(opcoes, JSON.stringify(atualizacao));
     if (res.errors) {
-      // Se ainda houver erro, loga e retorna null (sem recriar)
       console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${JSON.stringify(res.errors)}`);
       return null;
     }
