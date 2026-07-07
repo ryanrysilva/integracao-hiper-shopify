@@ -98,27 +98,31 @@ function criarProdutoShopify(token, produtoHiper) {
   });
 }
 
-function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
+// ============================================================
+// FUNÇÃO ATUALIZAR PRODUTO (CORRIGIDA PARA VARIAÇÕES)
+// ============================================================
+async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e estoque)...`);
 
-  let sku = produtoHiper.codigoDeBarras || '';
-  if (!sku && produtoHiper.variacao && produtoHiper.variacao.length > 0) {
-    sku = produtoHiper.variacao[0].codigoDeBarras || `SKU-${Date.now()}`;
-  } else if (!sku) {
-    sku = `SKU-${Date.now()}`;
-  }
+  // Se o produto tem variações no Hiper, vamos criar/atualizar todas
+  const temVariacoes = produtoHiper.variacao && produtoHiper.variacao.length > 0;
 
-  const variantsExistentes = produtoExistente.variants;
-  const defaultVariant = variantsExistentes.find(v => v.title === 'Default Title' && !v.sku);
+  // Mapeia variantes existentes na Shopify por SKU
   const mapaExistente = {};
-  variantsExistentes.forEach(v => { mapaExistente[v.sku] = v; });
+  produtoExistente.variants.forEach(v => { mapaExistente[v.sku] = v; });
+
+  // Identifica a variante "Default Title" (sem SKU)
+  const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title' && !v.sku);
 
   let variantsAtualizados = [];
 
-  if (produtoHiper.variacao && produtoHiper.variacao.length > 0) {
+  if (temVariacoes) {
+    // Caso 1: Produto COM variações no Hiper
+    console.log(`🔁 Produto com ${produtoHiper.variacao.length} variações no Hiper.`);
     produtoHiper.variacao.forEach(variacaoHiper => {
-      const varSku = variacaoHiper.codigoDeBarras || sku;
+      const varSku = variacaoHiper.codigoDeBarras || '';
       const existente = mapaExistente[varSku];
+      // Se a variação já existe na Shopify, atualiza. Senão, cria nova.
       if (existente) {
         variantsAtualizados.push({
           id: existente.id,
@@ -134,8 +138,16 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
         });
       }
     });
+    // Se existir a Default Title, ela será removida (não será incluída no array de variantes)
+    if (defaultVariant) {
+      console.log(`🗑️ Removendo "Default Title" porque o produto agora tem variações.`);
+      // Não a incluímos no array, então ela será deletada automaticamente pela Shopify
+    }
   } else {
+    // Caso 2: Produto SEM variações no Hiper
+    const sku = produtoHiper.codigoDeBarras || '';
     const existente = mapaExistente[sku];
+
     if (existente) {
       variantsAtualizados.push({
         id: existente.id,
@@ -160,6 +172,7 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   }
 
+  // Monta a atualização
   const atualizacao = {
     product: {
       id: produtoExistente.id,
@@ -182,14 +195,19 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   };
 
-  return request(opcoes, JSON.stringify(atualizacao)).then(res => {
+  try {
+    const res = await request(opcoes, JSON.stringify(atualizacao));
     if (res.errors) {
+      // Se ainda houver erro, loga e retorna null (sem recriar)
       console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${JSON.stringify(res.errors)}`);
       return null;
     }
     console.log(`✅ Produto "${produtoHiper.nome}" ATUALIZADO (preço/estoque) na Shopify!`);
     return res.product;
-  });
+  } catch (erro) {
+    console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${erro.message}`);
+    return null;
+  }
 }
 
 function buscarPedidosShopify(token, sinceId = 0) {
