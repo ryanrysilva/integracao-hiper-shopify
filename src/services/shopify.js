@@ -51,6 +51,9 @@ function excluirProdutoShopify(token, productId) {
   });
 }
 
+// ============================================================
+// FUNÇÃO CRIAR PRODUTO (CORRIGIDA – MANTÉM VARIAÇÕES NO FALLBACK)
+// ============================================================
 function criarProdutoShopify(token, produtoHiper) {
   console.log(`🔄 CRIANDO produto "${produtoHiper.nome}" na Shopify...`);
   let sku = produtoHiper.codigoDeBarras || '';
@@ -67,7 +70,9 @@ function criarProdutoShopify(token, produtoHiper) {
     }
   };
 
+  // Se tem variações no Hiper, cria todas
   if (produtoHiper.variacao && produtoHiper.variacao.length > 0) {
+    console.log(`🔁 Criando produto com ${produtoHiper.variacao.length} variações.`);
     produtoHiper.variacao.forEach(variacao => {
       const varSku = variacao.codigoDeBarras || sku;
       produtoShopify.product.variants.push({
@@ -78,6 +83,7 @@ function criarProdutoShopify(token, produtoHiper) {
       });
     });
   } else {
+    // Produto sem variações
     produtoShopify.product.variants.push({
       title: produtoHiper.nome,
       price: produtoHiper.preco.toString(),
@@ -98,15 +104,13 @@ function criarProdutoShopify(token, produtoHiper) {
 
   return request(opcoes, JSON.stringify(produtoShopify)).then(res => {
     if (res.errors) {
-      console.warn(`⚠️ Falha ao criar com título, tentando sem...`);
-      produtoShopify.product.variants = [{
-        price: produtoHiper.preco.toString(),
-        sku: sku,
-        inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0)
-      }];
+      // Se falhar, tenta criar SEM título, mas MANTENDO TODAS AS VARIAÇÕES
+      console.warn(`⚠️ Falha ao criar com título, tentando sem título (mas com todas as variações)...`);
+      // Remove o título de cada variante (mantém SKU, preço e estoque)
+      produtoShopify.product.variants.forEach(v => { delete v.title; });
       return request(opcoes, JSON.stringify(produtoShopify)).then(res2 => {
         if (res2.errors) throw new Error(JSON.stringify(res2.errors));
-        console.log(`✅ Produto "${produtoHiper.nome}" CRIADO na Shopify (sem título)! ID: ${res2.product.id}`);
+        console.log(`✅ Produto "${produtoHiper.nome}" CRIADO na Shopify (sem título, com ${produtoShopify.product.variants.length} variações)! ID: ${res2.product.id}`);
         return res2.product;
       });
     }
@@ -116,7 +120,7 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// FUNÇÃO DE DIAGNÓSTICO DETALHADO (ATUALIZADA)
+// FUNÇÃO DE DIAGNÓSTICO DETALHADO
 // ============================================================
 async function diagnosticarProduto(token, produtoHiper, produtoExistente) {
   console.log(`\n🔍 DIAGNÓSTICO PARA "${produtoHiper.nome}":`);
@@ -131,7 +135,6 @@ async function diagnosticarProduto(token, produtoHiper, produtoExistente) {
     produtoExistente.variants.forEach(v => {
       console.log(`      - SKU: ${v.sku || 'N/A'}, Título: ${v.title}, ID: ${v.id}`);
     });
-    // CORREÇÃO: busca por qualquer variante com título "Default Title"
     const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title');
     if (defaultVariant) {
       console.log(`  - ⚠️ DEFAULT TITLE encontrada! ID: ${defaultVariant.id}, SKU: ${defaultVariant.sku || 'N/A'}`);
@@ -145,12 +148,11 @@ async function diagnosticarProduto(token, produtoHiper, produtoExistente) {
 }
 
 // ============================================================
-// FUNÇÃO ATUALIZAR PRODUTO (COM CORREÇÃO DA DEFAULT TITLE)
+// FUNÇÃO ATUALIZAR PRODUTO
 // ============================================================
 async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e estoque)...`);
 
-  // 1. DIAGNÓSTICO
   await diagnosticarProduto(token, produtoHiper, produtoExistente);
 
   const temVariacoes = produtoHiper.variacao && produtoHiper.variacao.length > 0;
@@ -162,9 +164,8 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     return null;
   }
 
-  // 2. CORREÇÃO: busca por QUALQUER variante com título "Default Title"
-  const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title');
   let produtoAtualizado = produtoExistente;
+  const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title');
 
   if (defaultVariant) {
     console.log(`🔁 Tentando excluir "Default Title" (ID: ${defaultVariant.id}, SKU: ${defaultVariant.sku || 'N/A'})...`);
@@ -197,7 +198,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   }
 
-  // 3. Monta a lista de variantes
   const mapaExistente = {};
   produtoAtualizado.variants.forEach(v => { mapaExistente[v.sku] = v; });
 
@@ -241,7 +241,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   }
 
-  // 4. Envia a atualização
   const atualizacao = {
     product: {
       id: produtoAtualizado.id,
