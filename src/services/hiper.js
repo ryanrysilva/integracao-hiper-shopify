@@ -27,6 +27,22 @@ function buscarProdutosHiper(token, pontoSinc) {
   return request(opcoes).then(res => {
     if (res.errors && res.errors.length) throw new Error(res.errors.join(', '));
     console.log(`✅ ${res.produtos?.length || 0} produtos encontrados no Hiper`);
+
+    // ============================================================
+    // LOG DE DIAGNÓSTICO PARA A BLUSA ASTER
+    // ============================================================
+    const aster = res.produtos?.find(p => p.nome === 'Blusa Aster');
+    if (aster) {
+      console.log('🔍 DETALHES DA BLUSA ASTER:');
+      console.log('  grade:', aster.grade);
+      console.log('  variacao:', aster.variacao ? JSON.stringify(aster.variacao) : 'null');
+      console.log('  variacaoAtiva:', aster.variacaoAtiva);
+      console.log('  codigoDeBarras:', aster.codigoDeBarras);
+    } else {
+      console.log('⚠️ Blusa Aster NÃO encontrada na lista de produtos.');
+    }
+    // ============================================================
+
     return res;
   });
 }
