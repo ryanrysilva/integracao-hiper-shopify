@@ -1,6 +1,6 @@
 // server.js
 const express = require('express');
-const { sincronizar } = require('./index.js');
+const { sincronizar } = require('./src/services/sync.js');
 
 const app = express();
 const port = process.env.PORT || 3000;
