@@ -1,7 +1,14 @@
 // src/services/sync.js
 const fs = require('fs');
 const { gerarTokenHiper, buscarProdutosHiper, enviarPedidoParaHiper, consultarPedidoHiper, cancelarPedidoHiper } = require('./hiper.js');
-const { gerarTokenShopify, buscarProdutoPorSKU, criarProdutoShopify, arquivarProdutoShopify, buscarPedidosShopify } = require('./shopify.js');
+const {
+  gerarTokenShopify,
+  buscarProdutoPorSKU,
+  criarProdutoShopify,
+  atualizarProdutoShopify,
+  arquivarProdutoShopify,
+  buscarPedidosShopify
+} = require('./shopify.js');
 
 let ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
 if (fs.existsSync('state.json')) {
@@ -56,11 +63,9 @@ async function sincronizar() {
     let criados = 0;
     let atualizados = 0;
     let arquivados = 0;
-
-    // Lista para rastrear SKUs que já foram processados na criação
     const skusProcessados = new Set();
 
-    // Primeiro: arquiva produtos existentes com os mesmos SKUs (se não tiverem metafield)
+    // Primeiro: arquiva produtos antigos sem metafield (limpeza)
     console.log('\n🧹 Verificando produtos existentes para evitar duplicatas...');
     for (const produto of produtos) {
       if (produto.removido || !produto.ativo) continue;
@@ -75,7 +80,6 @@ async function sincronizar() {
       try {
         const existe = await buscarProdutoPorSKU(tokenShopify, sku);
         if (existe) {
-          // Verifica se o produto tem metafield do Hiper
           const temMetafield = existe.metafields && existe.metafields.some(mf => 
             mf.namespace === 'hiper' && mf.key === 'product_id'
           );
@@ -91,7 +95,7 @@ async function sincronizar() {
       }
     }
 
-    // Segundo: cria ou atualiza os produtos
+    // Segundo: cria ou atualiza produtos
     console.log('\n🚀 Criando/atualizando produtos...');
     for (const produto of produtos) {
       if (produto.removido || !produto.ativo) continue;
@@ -107,30 +111,25 @@ async function sincronizar() {
           continue;
         }
 
-        // Se este SKU já foi processado nesta execução, pula (evita loop)
         if (skusProcessados.has(sku)) {
           console.log(`⏩ SKU ${sku} já processado. Pulando...`);
           continue;
         }
 
-        // Busca novamente (pode ter sido arquivado)
         const existe = await buscarProdutoPorSKU(tokenShopify, sku);
 
         if (existe) {
           console.log(`📦 Produto "${produto.nome}" encontrado (SKU: ${sku}). Atualizando...`);
-          // Verifica se tem metafield
           const temMetafield = existe.metafields && existe.metafields.some(mf => 
             mf.namespace === 'hiper' && mf.key === 'product_id'
           );
           if (temMetafield) {
-            // Se tem metafield, apenas atualiza
             const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe);
             if (atualizado) {
               atualizados++;
               skusProcessados.add(sku);
             }
           } else {
-            // Se não tem metafield, arquiva e recria
             console.log(`🔄 Produto "${produto.nome}" sem metafield. Recriando...`);
             await arquivarProdutoShopify(tokenShopify, existe.id);
             await new Promise(resolve => setTimeout(resolve, 500));
@@ -141,7 +140,6 @@ async function sincronizar() {
             }
           }
         } else {
-          // Produto não existe, cria
           console.log(`🆕 Produto "${produto.nome}" não encontrado (SKU: ${sku}). Criando...`);
           const novo = await criarProdutoShopify(tokenShopify, produto);
           if (novo) {
