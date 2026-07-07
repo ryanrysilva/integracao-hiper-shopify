@@ -1,6 +1,6 @@
 // src/services/sync.js
-const fs = require('fs');
 const request = require('../utils/request.js');
+const { carregarEstado, salvarEstado } = require('../utils/stateStore.js');
 const { gerarTokenHiper, buscarProdutosHiper, enviarPedidoParaHiper, consultarPedidoHiper, cancelarPedidoHiper } = require('./hiper.js');
 const {
   gerarTokenShopify,
@@ -12,32 +12,9 @@ const {
   sleep
 } = require('./shopify.js');
 
-const STATE_PATH = 'state.json';
-
-let ESTADO = {
-  ultimoPedidoId: 0,
-  pontoDeSincronizacao: 0,
-  mapaSkuHiper: {},      // sku -> id do produto no Hiper (usado pra enviar pedidos)
-  produtosMap: {}        // hiperId -> { shopifyId, variants: [{ sku, variantId, inventoryItemId }] }
-};
-
-if (fs.existsSync(STATE_PATH)) {
-  try {
-    ESTADO = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
-    if (isNaN(ESTADO.pontoDeSincronizacao) || ESTADO.pontoDeSincronizacao < 0) ESTADO.pontoDeSincronizacao = 0;
-    if (!ESTADO.mapaSkuHiper || typeof ESTADO.mapaSkuHiper !== 'object') ESTADO.mapaSkuHiper = {};
-    if (!ESTADO.produtosMap || typeof ESTADO.produtosMap !== 'object') ESTADO.produtosMap = {};
-  } catch (e) {
-    console.warn('⚠️ state.json corrompido, resetando...');
-    ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0, mapaSkuHiper: {}, produtosMap: {} };
-  }
-}
-
-function salvarEstado() {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(ESTADO, null, 2));
-}
-
-// Converte o retorno de criação/atualização (REST) no formato compacto que guardamos no mapa
+// ============================================================
+// FUNÇÕES AUXILIARES PARA MAPEAMENTO (conversão de formato)
+// ============================================================
 function extrairMapaProduto(produtoShopifyResp) {
   return {
     shopifyId: produtoShopifyResp.id,
@@ -49,7 +26,6 @@ function extrairMapaProduto(produtoShopifyResp) {
   };
 }
 
-// Converte o registro do mapa local de volta pro formato que atualizarProdutoShopify espera
 function mapaParaProdutoExistente(mapaEntry) {
   return {
     id: mapaEntry.shopifyId,
@@ -57,16 +33,13 @@ function mapaParaProdutoExistente(mapaEntry) {
       id: v.variantId,
       sku: v.sku,
       inventory_item_id: v.inventoryItemId,
-      title: v.sku // não usamos "Default Title" aqui pois o mapa local já reflete o estado real
+      title: v.sku || 'Variant'
     }))
   };
 }
 
 // ============================================================
-// BUSCA PRODUTO PELO METAFIELD (via GraphQL) — usada só como
-// PLANO B, quando o produto não está no mapa local (produtosMap).
-// Mantida porque a busca da Shopify pode eventualmente encontrar
-// produtos criados manualmente ou antes de existir o mapa local.
+// FALLBACK: BUSCA POR METAFIELD (SÓ PARA PRODUTOS NÃO MAPEADOS)
 // ============================================================
 async function buscarProdutoPorMetafield(token, hiperId) {
   console.log(`🔍 [fallback] Buscando produto pelo metafield: hiper.product_id = ${hiperId}`);
@@ -150,6 +123,9 @@ async function buscarProdutoPorMetafield(token, hiperId) {
 async function sincronizar() {
   console.log('\n🚀 INICIANDO SINCRONIZAÇÃO COMPLETA (PRODUTOS + PEDIDOS)...\n');
 
+  // 1. CARREGA ESTADO DO UPSTASH (persistente entre deploys/restarts)
+  let ESTADO = await carregarEstado();
+
   try {
     const tokenHiper = await gerarTokenHiper();
     const tokenShopify = await gerarTokenShopify();
@@ -176,7 +152,7 @@ async function sincronizar() {
       console.log(`✅ ${produtos.length} produtos encontrados no Hiper.`);
     }
 
-    // mapaSkuHiper cumulativo (usado no envio de pedidos pro Hiper)
+    // 2. ATUALIZA MAPA SKU (cumulativo, usado para pedidos)
     for (const produto of produtos) {
       if (produto.variacao && produto.variacao.length > 0) {
         produto.variacao.forEach(v => { if (v.codigoDeBarras) ESTADO.mapaSkuHiper[v.codigoDeBarras] = v.id; });
@@ -189,13 +165,8 @@ async function sincronizar() {
     let criados = 0;
     let atualizados = 0;
 
-    // ============================================================
-    // CRIA OU ATUALIZA PRODUTOS — agora consultando primeiro o
-    // MAPA LOCAL (produtosMap), não a busca da Shopify.
-    // A busca (metafield/SKU) só entra como plano B, quando o
-    // hiperId ainda não está no mapa local.
-    // ============================================================
     console.log('\n🚀 Criando/atualizando produtos...');
+
     for (const produto of produtos) {
       if (produto.removido || !produto.ativo) continue;
       if (produto.produtoPrimarioId && produto.produtoPrimarioId !== '00000000-0000-0000-0000-000000000000') continue;
@@ -210,10 +181,11 @@ async function sincronizar() {
           continue;
         }
 
+        // 3. VERIFICA SE O PRODUTO JÁ ESTÁ NO MAPA (produtosMap)
         const mapaEntry = ESTADO.produtosMap[produto.id];
 
         if (mapaEntry) {
-          // ✅ Já sabemos o ID do Shopify — sem precisar buscar. Rápido e confiável.
+          // ✅ Já mapeado → atualiza diretamente pelo Shopify ID
           console.log(`📦 Produto "${produto.nome}" já mapeado (Shopify ID: ${mapaEntry.shopifyId}). Atualizando...`);
           const produtoExistente = mapaParaProdutoExistente(mapaEntry);
           const atualizado = await atualizarProdutoShopify(tokenShopify, produto, produtoExistente);
@@ -222,14 +194,14 @@ async function sincronizar() {
             atualizados++;
           }
         } else {
-          // Plano B: produto não está no nosso mapa ainda. Tenta achar na Shopify
-          // (pode ser produto antigo, criado manualmente, ou de antes desta versão do código).
+          // 4. NÃO ESTÁ NO MAPA → tenta fallback (metafield ou SKU)
           let existe = await buscarProdutoPorMetafield(tokenShopify, produto.id);
           if (!existe) {
             existe = await buscarProdutoPorSKU(tokenShopify, sku);
           }
 
           if (existe) {
+            // Encontrou via fallback → atualiza e adiciona ao mapa
             console.log(`📦 Produto "${produto.nome}" encontrado via busca (SKU: ${sku}). Atualizando e mapeando...`);
             const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe);
             if (atualizado) {
@@ -237,6 +209,7 @@ async function sincronizar() {
               atualizados++;
             }
           } else {
+            // Não encontrou → cria novo
             console.log(`🆕 Produto "${produto.nome}" não encontrado (SKU: ${sku}). Criando...`);
             const novo = await criarProdutoShopify(tokenShopify, produto);
             if (novo) {
@@ -246,16 +219,16 @@ async function sincronizar() {
           }
         }
 
-        // Salva a cada produto processado — se o processo cair no meio do caminho
-        // (ex: reinício no Render), não perdemos o que já foi mapeado até aqui.
-        salvarEstado();
+        // 5. SALVA NO UPSTASH A CADA PRODUTO (progresso parcial)
+        await salvarEstado(ESTADO);
 
       } catch (erro) {
         console.error(`❌ Erro ao processar "${produto.nome}":`, erro.message);
       }
-      await sleep(400); // respiro entre produtos pra evitar rate limit
+      await sleep(400);
     }
 
+    // 6. ATUALIZA PONTO DE SINCRONIZAÇÃO
     if (produtos.length > 0 && (criados > 0 || atualizados > 0)) {
       if (ponto && !isNaN(ponto) && ponto >= 0 && ponto > ESTADO.pontoDeSincronizacao) {
         ESTADO.pontoDeSincronizacao = ponto;
@@ -271,9 +244,10 @@ async function sincronizar() {
     console.log(`📦 ${criados} produtos CRIADOS.`);
     console.log(`🔄 ${atualizados} produtos ATUALIZADOS.`);
 
-    salvarEstado();
+    // 7. SALVA ESTADO FINAL (antes dos pedidos)
+    await salvarEstado(ESTADO);
 
-    // --- PEDIDOS ---
+    // --- PEDIDOS (usando mapaSkuHiper persistente) ---
     const pedidos = await buscarPedidosShopify(tokenShopify, ESTADO.ultimoPedidoId || 0);
     let enviados = 0;
     const pedidosEnviados = [];
@@ -306,11 +280,14 @@ async function sincronizar() {
       }
     }
 
-    salvarEstado();
-    console.log(`\n✅ ESTADO SALVO.`);
+    // 8. SALVA ESTADO FINAL
+    await salvarEstado(ESTADO);
+    console.log(`\n✅ ESTADO SALVO NO UPSTASH (${Object.keys(ESTADO.produtosMap).length} produtos mapeados).`);
 
   } catch (erro) {
     console.error('❌ ERRO NA SINCRONIZAÇÃO:', erro.message);
+    // Tenta salvar o que deu mesmo em erro
+    await salvarEstado(ESTADO).catch(() => {});
   }
 }
 
