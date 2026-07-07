@@ -57,6 +57,9 @@ async function sincronizar() {
     let atualizados = 0;
     let arquivados = 0;
 
+    // Lista para rastrear SKUs que já foram processados na criação
+    const skusProcessados = new Set();
+
     // Primeiro: arquiva produtos existentes com os mesmos SKUs (se não tiverem metafield)
     console.log('\n🧹 Verificando produtos existentes para evitar duplicatas...');
     for (const produto of produtos) {
@@ -80,7 +83,6 @@ async function sincronizar() {
             console.log(`📦 Arquivando produto antigo "${produto.nome}" (SKU: ${sku})...`);
             await arquivarProdutoShopify(tokenShopify, existe.id);
             arquivados++;
-            // Aguarda um pouco para não sobrecarregar a API
             await new Promise(resolve => setTimeout(resolve, 500));
           }
         }
@@ -105,6 +107,12 @@ async function sincronizar() {
           continue;
         }
 
+        // Se este SKU já foi processado nesta execução, pula (evita loop)
+        if (skusProcessados.has(sku)) {
+          console.log(`⏩ SKU ${sku} já processado. Pulando...`);
+          continue;
+        }
+
         // Busca novamente (pode ter sido arquivado)
         const existe = await buscarProdutoPorSKU(tokenShopify, sku);
 
@@ -117,20 +125,29 @@ async function sincronizar() {
           if (temMetafield) {
             // Se tem metafield, apenas atualiza
             const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe);
-            if (atualizado) atualizados++;
+            if (atualizado) {
+              atualizados++;
+              skusProcessados.add(sku);
+            }
           } else {
             // Se não tem metafield, arquiva e recria
             console.log(`🔄 Produto "${produto.nome}" sem metafield. Recriando...`);
             await arquivarProdutoShopify(tokenShopify, existe.id);
             await new Promise(resolve => setTimeout(resolve, 500));
-            await criarProdutoShopify(tokenShopify, produto);
-            criados++;
+            const novo = await criarProdutoShopify(tokenShopify, produto);
+            if (novo) {
+              criados++;
+              skusProcessados.add(sku);
+            }
           }
         } else {
           // Produto não existe, cria
           console.log(`🆕 Produto "${produto.nome}" não encontrado (SKU: ${sku}). Criando...`);
-          await criarProdutoShopify(tokenShopify, produto);
-          criados++;
+          const novo = await criarProdutoShopify(tokenShopify, produto);
+          if (novo) {
+            criados++;
+            skusProcessados.add(sku);
+          }
         }
 
       } catch (erro) {
