@@ -1,5 +1,6 @@
 const https = require('https');
 const fs = require('fs');
+const request = require('./src/utils/request.js'); // <-- NOVA IMPORTAÇÃO
 
 // ============================================================
 // CARREGAR CONFIGURAÇÕES DAS VARIÁVEIS DE AMBIENTE
@@ -29,25 +30,9 @@ if (fs.existsSync('state.json')) {
   }
 }
 
-function request(opcoes, dados = null) {
-  return new Promise((resolve, reject) => {
-    const req = https.request(opcoes, (res) => {
-      let resposta = '';
-      res.on('data', (chunk) => resposta += chunk);
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(resposta));
-        } catch (e) {
-          reject(new Error('Erro ao parsear: ' + resposta.substring(0, 200)));
-        }
-      });
-    });
-    req.on('error', reject);
-    if (dados) req.write(dados);
-    req.end();
-  });
-}
-
+// ============================================================
+// 1. GERAR TOKENS
+// ============================================================
 function gerarTokenHiper() {
   console.log('🔄 Gerando token do Hiper...');
   const opcoes = {
@@ -81,6 +66,9 @@ function gerarTokenShopify() {
   });
 }
 
+// ============================================================
+// 2. PRODUTOS
+// ============================================================
 function buscarProdutosHiper(token, pontoSinc) {
   console.log(`🔄 Buscando produtos do Hiper (ponto: ${pontoSinc})...`);
   const opcoes = {
@@ -263,7 +251,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   try {
     const res = await request(opcoes, JSON.stringify(atualizacao));
     if (res.errors) {
-      // NÃO RECRIA, apenas loga o erro
       console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${JSON.stringify(res.errors)}`);
       return null;
     }
