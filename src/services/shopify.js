@@ -22,41 +22,28 @@ function gerarTokenShopify() {
 }
 
 // ============================================================
-// BUSCA PRODUTO POR METAFIELD (REST — SUPORTADO)
+// BUSCA PRODUTO POR SKU (PRIMÁRIO)
 // ============================================================
-function buscarProdutoPorHiperId(token, hiperId) {
-  console.log(`🔍 Buscando produto pelo metafield: hiper.product_id = ${hiperId}`);
-  const query = `metafields.owner_type:Product AND metafields.namespace:hiper AND metafields.key:product_id AND metafields.value:${hiperId}`;
+function buscarProdutoPorSKU(token, sku) {
+  if (!sku) return Promise.resolve(null);
+  console.log(`🔍 Buscando produto pelo SKU: ${sku}`);
   const opcoes = {
     hostname: `${CONFIG.shopify.loja}.myshopify.com`,
-    path: `/admin/api/2026-07/products.json?fields=id,title,metafields&metafield_query=${encodeURIComponent(query)}`,
+    path: `/admin/api/2026-07/products.json?sku=${encodeURIComponent(sku)}&status=any`,
     method: 'GET',
     headers: { 'X-Shopify-Access-Token': token }
   };
   return request(opcoes).then(res => {
     if (res.errors) throw new Error(JSON.stringify(res.errors));
-    const product = res.products && res.products.length > 0 ? res.products[0] : null;
-    if (!product) return null;
-    // Agora busca as variantes completas para esse produto
-    const opcoesVariants = {
-      hostname: `${CONFIG.shopify.loja}.myshopify.com`,
-      path: `/admin/api/2026-07/products/${product.id}/variants.json`,
-      method: 'GET',
-      headers: { 'X-Shopify-Access-Token': token }
-    };
-    return request(opcoesVariants).then(resVariants => {
-      return {
-        id: product.id,
-        title: product.title,
-        variants: resVariants.variants || [],
-        metafields: product.metafields || []
-      };
-    });
+    const products = res.products || [];
+    if (products.length === 0) return null;
+    // Retorna o primeiro produto (pode ser ativo ou arquivado)
+    return products[0];
   });
 }
 
 // ============================================================
-// ARQUIVAR PRODUTO (USADO APENAS EM CASO EXTREMO)
+// ARQUIVAR PRODUTO (USADO APENAS PARA LIMPEZA, NÃO NO LOOP)
 // ============================================================
 function arquivarProdutoShopify(token, productId) {
   console.log(`📦 Arquivando produto ID ${productId}...`);
@@ -81,7 +68,32 @@ function arquivarProdutoShopify(token, productId) {
 }
 
 // ============================================================
-// CRIAR PRODUTO (COM METAFIELD)
+// RESTAURAR PRODUTO (SE ESTIVER ARQUIVADO)
+// ============================================================
+function restaurarProdutoShopify(token, productId) {
+  console.log(`♻️ Restaurando produto ID ${productId}...`);
+  const opcoes = {
+    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+    path: `/admin/api/2026-07/products/${productId}.json`,
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': token
+    }
+  };
+  const payload = { product: { status: 'active' } };
+  return request(opcoes, JSON.stringify(payload)).then(res => {
+    if (res.errors) throw new Error(JSON.stringify(res.errors));
+    console.log(`✅ Produto ${productId} restaurado.`);
+    return res.product;
+  }).catch((err) => {
+    console.warn(`⚠️ Erro ao restaurar produto: ${err.message}`);
+    return null;
+  });
+}
+
+// ============================================================
+// CRIAR PRODUTO (COM METAFIELD E SKU)
 // ============================================================
 function criarProdutoShopify(token, produtoHiper) {
   console.log(`🔄 CRIANDO produto "${produtoHiper.nome}" na Shopify...`);
@@ -162,11 +174,10 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// ATUALIZAR ESTOQUE VIA INVENTORY API (CORRETO)
+// ATUALIZAR ESTOQUE VIA INVENTORY API
 // ============================================================
 function atualizarEstoqueShopify(token, variantId, quantity, locationId = null) {
   if (!locationId) {
-    // Busca o primeiro location disponível
     const opcoesLoc = {
       hostname: `${CONFIG.shopify.loja}.myshopify.com`,
       path: '/admin/api/2026-07/locations.json',
@@ -191,7 +202,7 @@ function atualizarEstoqueShopify(token, variantId, quantity, locationId = null) 
   };
   const payload = {
     location_id: locationId,
-    inventory_item_id: variantId, // Na verdade, é o inventory_item_id, mas a Shopify aceita o variant_id
+    inventory_item_id: variantId,
     available: quantity
   };
   return request(opcoes, JSON.stringify(payload)).then(res => {
@@ -202,14 +213,22 @@ function atualizarEstoqueShopify(token, variantId, quantity, locationId = null) 
 }
 
 // ============================================================
-// ATUALIZAR PRODUTO (SEM FALLBACK, SEM RECRIAR EM ERRO)
+// ATUALIZAR PRODUTO (POR SKU)
 // ============================================================
 async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e estoque)...`);
 
+  // Verifica se o produto existe e tem variantes
   if (!produtoExistente || !produtoExistente.variants || produtoExistente.variants.length === 0) {
-    console.error(`❌ Produto "${produtoHiper.nome}" não tem variantes válidas. Não é possível atualizar.`);
-    return null;
+    console.error(`❌ Produto "${produtoHiper.nome}" não encontrado ou sem variantes. Recriando...`);
+    return criarProdutoShopify(token, produtoHiper);
+  }
+
+  // Se o produto estiver arquivado, restaura primeiro
+  if (produtoExistente.status === 'archived') {
+    console.log(`♻️ Produto "${produtoHiper.nome}" está arquivado. Restaurando...`);
+    const restaurado = await restaurarProdutoShopify(token, produtoExistente.id);
+    if (restaurado) produtoExistente = restaurado;
   }
 
   // 1. Remove a Default Title (se existir)
@@ -227,14 +246,15 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       console.log(`✅ "Default Title" excluída.`);
       await new Promise(resolve => setTimeout(resolve, 1000));
       // Recarrega o produto para pegar as variantes atualizadas
-      const recarregado = await buscarProdutoPorHiperId(token, produtoHiper.id);
+      const recarregado = await buscarProdutoPorSKU(token, produtoHiper.codigoDeBarras || 
+        (produtoHiper.variacao && produtoHiper.variacao.length > 0 ? produtoHiper.variacao[0].codigoDeBarras : ''));
       if (recarregado) produtoExistente = recarregado;
     } catch (erro) {
       console.warn(`⚠️ Erro ao excluir Default Title: ${erro.message}. Continuando...`);
     }
   }
 
-  // 2. Monta a atualização de preço/opções (sem metafields e sem estoque)
+  // 2. Monta a atualização de preço/opções (sem metafields)
   const temVariacoes = produtoHiper.variacao && produtoHiper.variacao.length > 0;
   const sku = produtoHiper.codigoDeBarras || 
               (temVariacoes ? produtoHiper.variacao[0].codigoDeBarras : '');
@@ -261,7 +281,7 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       }
       if (existente) {
         variant.id = existente.id;
-        // Atualiza estoque via Inventory API (não via product)
+        // Atualiza estoque via Inventory API
         if (existente.id) {
           atualizarEstoqueShopify(token, existente.id, Math.floor(variacaoHiper.quantidadeEmEstoque || 0))
             .catch(err => console.warn(`⚠️ Erro ao atualizar estoque da variante ${existente.id}: ${err.message}`));
@@ -326,7 +346,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     const res = await request(opcoes, JSON.stringify(atualizacao));
     if (res.errors) {
       console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${JSON.stringify(res.errors)}`);
-      // NÃO RECRIA — apenas loga e retorna null
       return null;
     }
     console.log(`✅ Produto "${produtoHiper.nome}" ATUALIZADO (preço e opções) na Shopify!`);
@@ -355,7 +374,7 @@ function buscarPedidosShopify(token, sinceId = 0) {
 
 module.exports = {
   gerarTokenShopify,
-  buscarProdutoPorHiperId,
+  buscarProdutoPorSKU,
   criarProdutoShopify,
   atualizarProdutoShopify,
   buscarPedidosShopify
