@@ -22,12 +22,14 @@ if (fs.existsSync('state.json')) {
 }
 
 // ============================================================
-// FUNÇÃO PARA BUSCAR PRODUTO PELO METAFIELD (via GraphQL)
+// FUNÇÃO PARA BUSCAR PRODUTO PELO METAFIELD (GRAPHQL CORRIGIDO)
 // ============================================================
 async function buscarProdutoPorMetafield(token, hiperId) {
   console.log(`🔍 Buscando produto pelo metafield: hiper.product_id = ${hiperId}`);
+  
+  // Query corrigida: metafields.<namespace>.<key>:<value> e valor entre aspas simples
   const query = `{
-    products(first: 1, query: "metafield_namespace:hiper AND metafield_key:product_id AND metafield_value:${hiperId}") {
+    products(first: 1, query: "metafields.hiper.product_id:'${hiperId}'") {
       edges {
         node {
           id
@@ -76,7 +78,23 @@ async function buscarProdutoPorMetafield(token, hiperId) {
     if (res.errors) throw new Error(JSON.stringify(res.errors));
     const edges = res.data?.products?.edges || [];
     if (edges.length === 0) return null;
+    
     const product = edges[0].node;
+    const metafields = product.metafields.edges.map(edge => ({
+      namespace: edge.node.namespace,
+      key: edge.node.key,
+      value: edge.node.value
+    }));
+
+    // ✅ VALIDAÇÃO EXTRA: confirma se o metafield realmente corresponde ao hiperId buscado
+    const metafieldConfere = metafields.some(
+      mf => mf.namespace === 'hiper' && mf.key === 'product_id' && mf.value === hiperId
+    );
+    if (!metafieldConfere) {
+      console.warn(`⚠️ Produto retornado não bate com hiperId ${hiperId}. Ignorando.`);
+      return null;
+    }
+
     return {
       id: product.id.replace('gid://shopify/Product/', ''),
       title: product.title,
@@ -88,11 +106,7 @@ async function buscarProdutoPorMetafield(token, hiperId) {
         inventory_quantity: edge.node.inventoryQuantity,
         inventory_item_id: edge.node.inventoryItem?.id?.replace('gid://shopify/InventoryItem/', '')
       })),
-      metafields: product.metafields.edges.map(edge => ({
-        namespace: edge.node.namespace,
-        key: edge.node.key,
-        value: edge.node.value
-      }))
+      metafields
     };
   } catch (err) {
     console.error(`❌ Erro ao buscar metafield ${hiperId}:`, err.message);
@@ -160,10 +174,8 @@ async function sincronizar() {
       if (!sku) continue;
 
       try {
-        // Busca pelo metafield primeiro
         let existe = await buscarProdutoPorMetafield(tokenShopify, produto.id);
         if (!existe) {
-          // Fallback: busca por SKU
           existe = await buscarProdutoPorSKU(tokenShopify, sku);
         }
         if (existe) {
@@ -203,10 +215,7 @@ async function sincronizar() {
           continue;
         }
 
-        // 1. Busca pelo metafield (ID do Hiper)
         let existe = await buscarProdutoPorMetafield(tokenShopify, produto.id);
-
-        // 2. Se não encontrou, busca por SKU (fallback)
         if (!existe) {
           existe = await buscarProdutoPorSKU(tokenShopify, sku);
         }
