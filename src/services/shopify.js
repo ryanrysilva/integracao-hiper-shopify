@@ -170,7 +170,6 @@ function criarProdutoShopify(token, produtoHiper) {
     produtoShopify.product.options = opcoes;
 
     produtoHiper.variacao.forEach((variacao, idx) => {
-      // ✅ FIX: cada variação sem codigoDeBarras recebe um SKU único (não repete o SKU do pai)
       const varSku = variacao.codigoDeBarras || `${sku}-V${idx + 1}`;
       const variant = {
         sku: varSku,
@@ -213,45 +212,61 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// ATUALIZAR ESTOQUE (VIA INVENTORY API)
+// CACHE DE LOCATION + ATUALIZAR ESTOQUE (NOVA VERSÃO)
 // ============================================================
-function atualizarEstoqueShopify(token, inventoryItemId, quantity, locationId = null) {
+
+// Cache do location — evita bater na API a cada variante
+let _locationIdCache = null;
+
+async function obterLocationId(token) {
+  if (_locationIdCache) return _locationIdCache;
+
+  const opcoes = {
+    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+    path: '/admin/api/2026-07/locations.json',
+    method: 'GET',
+    headers: { 'X-Shopify-Access-Token': token }
+  };
+  const res = await request(opcoes);
+
+  if (res.errors) {
+    throw new Error(`Erro ao buscar locations: ${JSON.stringify(res.errors)}`);
+  }
+  if (!res.locations || res.locations.length === 0) {
+    throw new Error('Nenhum location retornado pela Shopify. Verifique se o app tem o scope "read_locations" habilitado.');
+  }
+
+  _locationIdCache = res.locations[0].id;
+  console.log(`📍 Location detectado e cacheado: ${_locationIdCache}`);
+  return _locationIdCache;
+}
+
+async function atualizarEstoqueShopify(token, inventoryItemId, quantity, locationId = null) {
   if (!inventoryItemId) {
     console.warn('⚠️ inventoryItemId não informado. Pulando atualização de estoque.');
-    return Promise.resolve();
+    return;
   }
-  const buscaLocation = locationId ? Promise.resolve({ locations: [{ id: locationId }] }) :
-    request({
-      hostname: `${CONFIG.shopify.loja}.myshopify.com`,
-      path: '/admin/api/2026-07/locations.json',
-      method: 'GET',
-      headers: { 'X-Shopify-Access-Token': token }
-    });
-  return buscaLocation.then(res => {
-    if (!res.locations || res.locations.length === 0) {
-      throw new Error('Nenhum location encontrado');
+
+  const locId = locationId || await obterLocationId(token);
+
+  const opcoes = {
+    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+    path: '/admin/api/2026-07/inventory_levels/set.json',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': token
     }
-    const locId = locationId || res.locations[0].id;
-    const opcoes = {
-      hostname: `${CONFIG.shopify.loja}.myshopify.com`,
-      path: '/admin/api/2026-07/inventory_levels/set.json',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token
-      }
-    };
-    const payload = {
-      location_id: locId,
-      inventory_item_id: inventoryItemId,
-      available: Math.max(0, quantity)
-    };
-    return request(opcoes, JSON.stringify(payload)).then(res => {
-      if (res.errors) throw new Error(JSON.stringify(res.errors));
-      console.log(`✅ Estoque do inventory_item ${inventoryItemId} atualizado para ${quantity}`);
-      return res;
-    });
-  });
+  };
+  const payload = {
+    location_id: locId,
+    inventory_item_id: inventoryItemId,
+    available: Math.max(0, quantity)
+  };
+  const res = await request(opcoes, JSON.stringify(payload));
+  if (res.errors) throw new Error(JSON.stringify(res.errors));
+  console.log(`✅ Estoque do inventory_item ${inventoryItemId} atualizado para ${quantity}`);
+  return res;
 }
 
 // ============================================================
@@ -296,7 +311,6 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
 
     for (let idx = 0; idx < produtoHiper.variacao.length; idx++) {
       const variacaoHiper = produtoHiper.variacao[idx];
-      // ✅ FIX: mesmo fallback único de SKU usado na criação
       const varSku = variacaoHiper.codigoDeBarras || `${sku}-V${idx + 1}`;
       const existente = mapaExistente[varSku];
       const variant = { sku: varSku, price: produtoHiper.preco.toString(), option1: variacaoHiper.nomeVariacaoA || 'Padrão' };
@@ -307,7 +321,7 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
         if (existente.inventory_item_id) {
           await atualizarEstoqueShopify(token, existente.inventory_item_id, Math.floor(variacaoHiper.quantidadeEmEstoque || 0))
             .catch(err => console.warn(`⚠️ Erro ao atualizar estoque da variante ${existente.id}: ${err.message}`));
-          await sleep(300); // pequeno respiro entre chamadas de estoque
+          await sleep(300);
         }
       } else {
         variant.inventory_quantity = Math.floor(variacaoHiper.quantidadeEmEstoque || 0);
