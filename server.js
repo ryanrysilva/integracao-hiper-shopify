@@ -10,16 +10,15 @@ app.get('/', (req, res) => {
   res.send('Integração Hiper-Shopify está online!');
 });
 
-// Rota para disparar a sincronização manualmente
-app.get('/sync', async (req, res) => {
-  console.log('🔄 Sincronização manual iniciada...');
-  try {
-    await sincronizar();
-    res.status(200).send('Sincronização concluída com sucesso.');
-  } catch (error) {
-    console.error('❌ Erro na sincronização:', error.message);
-    res.status(500).send('Erro na sincronização. Verifique os logs.');
-  }
+// Rota para disparar a sincronização (resposta imediata)
+app.get('/sync', (req, res) => {
+  // Responde imediatamente com 202 Accepted
+  res.status(202).send('Sincronização iniciada em background.');
+  
+  // Executa a sincronização em segundo plano (fire-and-forget)
+  sincronizar().catch(err => {
+    console.error('❌ Erro na sincronização em background:', err.message);
+  });
 });
 
 // Inicia o servidor
