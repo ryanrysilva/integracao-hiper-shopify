@@ -22,7 +22,7 @@ if (!CONFIG.hiper.chave || !CONFIG.shopify.loja || !CONFIG.shopify.client_id || 
 }
 
 // ============================================================
-// ESTADO (com fallback)
+// ESTADO
 // ============================================================
 let ESTADO = { ultimoPedidoId: 0, pontoDeSincronizacao: 0 };
 if (fs.existsSync('state.json')) {
@@ -96,9 +96,9 @@ function gerarTokenShopify() {
 }
 
 // ============================================================
-// 2. PRODUTOS (CRIAR, ATUALIZAR, BUSCAR)
+// 2. PRODUTOS
 // ============================================================
-function buscarProdutosHiper(token, pontoSinc = 0) {
+function buscarProdutosHiper(token, pontoSinc) {
   console.log(`🔄 Buscando produtos do Hiper (ponto: ${pontoSinc})...`);
   const opcoes = {
     hostname: 'ms-ecommerce.hiper.com.br',
@@ -107,7 +107,9 @@ function buscarProdutosHiper(token, pontoSinc = 0) {
     headers: { 'Authorization': `Bearer ${token}` }
   };
   return request(opcoes).then(res => {
-    if (res.errors && res.errors.length) throw new Error(res.errors.join(', '));
+    if (res.errors && res.errors.length) {
+      throw new Error(res.errors.join(', '));
+    }
     console.log(`✅ ${res.produtos?.length || 0} produtos encontrados no Hiper`);
     return res;
   });
@@ -174,16 +176,11 @@ function criarProdutoShopify(token, produtoHiper) {
   });
 }
 
-// ============================================================
-// FUNÇÃO ATUALIZAR PRODUTO (CORRIGIDA PARA DEFAULT TITLE)
-// ============================================================
 function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (incluindo PREÇO e ESTOQUE)...`);
 
   const mapaExistente = {};
-  produtoExistente.variants.forEach(v => { 
-    mapaExistente[v.sku] = v; 
-  });
+  produtoExistente.variants.forEach(v => { mapaExistente[v.sku] = v; });
 
   let variantsAtualizados = [];
 
@@ -191,7 +188,6 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     produtoHiper.variacao.forEach(variacaoHiper => {
       const sku = variacaoHiper.codigoDeBarras || '';
       const existente = mapaExistente[sku];
-      
       if (existente) {
         variantsAtualizados.push({
           id: existente.id,
@@ -266,7 +262,7 @@ function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
 }
 
 // ============================================================
-// 3. PEDIDOS (BUSCAR NA SHOPIFY E ENVIAR PARA O HIPER)
+// 3. PEDIDOS
 // ============================================================
 function buscarPedidosShopify(token, sinceId = 0) {
   console.log(`🔄 Buscando pedidos novos na Shopify (since_id: ${sinceId})...`);
@@ -418,7 +414,7 @@ function cancelarPedidoHiper(token, pedidoId) {
 }
 
 // ============================================================
-// FUNÇÃO PRINCIPAL (com fallback e salvamento condicional)
+// FUNÇÃO PRINCIPAL (com fallback robusto)
 // ============================================================
 async function sincronizar() {
   console.log('\n🚀 INICIANDO SINCRONIZAÇÃO COMPLETA (PRODUTOS + PEDIDOS)...\n');
@@ -428,21 +424,31 @@ async function sincronizar() {
     const tokenShopify = await gerarTokenShopify();
 
     // --- PRODUTOS ---
-    const produtosHiper = await buscarProdutosHiper(tokenHiper, ESTADO.pontoDeSincronizacao || 0);
+    let produtos = [];
+    let ponto = 0;
+    let pontoOriginal = ESTADO.pontoDeSincronizacao;
 
-    let produtos = produtosHiper.produtos || [];
-    let ponto = produtosHiper.pontoDeSincronizacao;
-
-    if (produtos.length === 0 && ESTADO.pontoDeSincronizacao > 0) {
-      console.warn('⚠️ Nenhum produto com o ponto atual. Tentando sincronização completa (ponto=0)...');
-      const fallback = await buscarProdutosHiper(tokenHiper, 0);
-      if (fallback.produtos && fallback.produtos.length > 0) {
-        produtos = fallback.produtos;
-        ponto = fallback.pontoDeSincronizacao;
-        console.log(`✅ Fallback encontrou ${produtos.length} produtos.`);
-      }
+    try {
+      // Tenta com o ponto salvo
+      const resposta = await buscarProdutosHiper(tokenHiper, pontoOriginal);
+      produtos = resposta.produtos || [];
+      ponto = resposta.pontoDeSincronizacao;
+    } catch (erro) {
+      console.warn(`⚠️ Erro ao buscar com ponto ${pontoOriginal}: ${erro.message}`);
+      console.warn('🔄 Tentando sincronização completa com ponto=0...');
+      const resposta = await buscarProdutosHiper(tokenHiper, 0);
+      produtos = resposta.produtos || [];
+      ponto = resposta.pontoDeSincronizacao;
     }
 
+    // Se mesmo assim não tiver produtos, avisa e encerra a parte de produtos
+    if (produtos.length === 0) {
+      console.warn('⚠️ Nenhum produto encontrado. Verifique se há produtos com a flag "Loja virtual" ativada.');
+    } else {
+      console.log(`✅ ${produtos.length} produtos encontrados no Hiper.`);
+    }
+
+    // Constrói mapa SKU -> ID do Hiper
     const mapaSkuHiper = {};
     for (const produto of produtos) {
       if (produto.variacao && produto.variacao.length > 0) {
@@ -486,6 +492,7 @@ async function sincronizar() {
       }
     }
 
+    // Atualiza o ponto de sincronização apenas se encontrou produtos e o ponto é válido
     if (produtos.length > 0 && ponto && !isNaN(ponto) && ponto >= 0) {
       if (ponto > ESTADO.pontoDeSincronizacao) {
         ESTADO.pontoDeSincronizacao = ponto;
@@ -547,7 +554,7 @@ async function sincronizar() {
 }
 
 // ============================================================
-// EXPORTAR FUNÇÕES
+// EXPORTAR E EXECUTAR
 // ============================================================
 module.exports = {
   sincronizar,
@@ -555,7 +562,4 @@ module.exports = {
   cancelarPedidoHiper
 };
 
-// ============================================================
-// EXECUTAR
-// ============================================================
 sincronizar();
