@@ -43,7 +43,6 @@ function mapaParaProdutoExistente(mapaEntry) {
 // ============================================================
 async function buscarProdutoPorMetafield(token, hiperId) {
   console.log(`🔍 [fallback] Buscando produto pelo metafield: hiper.product_id = ${hiperId}`);
-
   const query = `{
     products(first: 1, query: "metafields.hiper.product_id:'${hiperId}'") {
       edges {
@@ -69,7 +68,6 @@ async function buscarProdutoPorMetafield(token, hiperId) {
       }
     }
   }`;
-
   const opcoes = {
     hostname: `${process.env.SHOPIFY_STORE}.myshopify.com`,
     path: '/admin/api/2026-07/graphql.json',
@@ -79,25 +77,21 @@ async function buscarProdutoPorMetafield(token, hiperId) {
       'X-Shopify-Access-Token': token
     }
   };
-
   try {
     const res = await request(opcoes, JSON.stringify({ query }));
     if (res.errors) throw new Error(JSON.stringify(res.errors));
     const edges = res.data?.products?.edges || [];
     if (edges.length === 0) return null;
-
     const product = edges[0].node;
     const metafields = product.metafields.edges.map(edge => ({
       namespace: edge.node.namespace,
       key: edge.node.key,
       value: edge.node.value
     }));
-
     const metafieldConfere = metafields.some(
       mf => mf.namespace === 'hiper' && mf.key === 'product_id' && mf.value === hiperId
     );
     if (!metafieldConfere) return null;
-
     return {
       id: product.id.replace('gid://shopify/Product/', ''),
       title: product.title,
@@ -118,81 +112,108 @@ async function buscarProdutoPorMetafield(token, hiperId) {
 }
 
 // ============================================================
+// ARQUIVA UM PRODUTO MAPEADO NA SHOPIFY
+// ------------------------------------------------------------
+// Só remove do mapa local se a arquivação na Shopify realmente
+// funcionar. Se falhar, mantemos o mapeamento pra tentar de novo
+// no próximo ciclo em vez de "esquecer" o produto e ele ficar
+// ativo na loja pra sempre por engano.
+// ============================================================
+async function arquivarSeMapeado(tokenShopify, ESTADO, hiperId, motivo) {
+  const mapaEntry = ESTADO.produtosMap[hiperId];
+  if (!mapaEntry) return false;
+  console.log(`🗑️ Produto ${hiperId} ${motivo}. Arquivando na Shopify...`);
+  const ok = await arquivarProdutoShopify(tokenShopify, mapaEntry.shopifyId);
+  if (ok) {
+    delete ESTADO.produtosMap[hiperId];
+    return true;
+  }
+  console.warn(`⚠️ Falha ao arquivar produto ${hiperId} — mantendo o mapeamento para tentar de novo no próximo ciclo.`);
+  return false;
+}
+
+// ============================================================
 // FUNÇÃO PRINCIPAL DE SINCRONIZAÇÃO
 // ============================================================
 async function sincronizar() {
   console.log('\n🚀 INICIANDO SINCRONIZAÇÃO COMPLETA (PRODUTOS + PEDIDOS)...\n');
-
   let ESTADO = await carregarEstado();
   if (ESTADO.falhasPonto === undefined) ESTADO.falhasPonto = 0;
+  if (ESTADO.ultimaSyncCompletaEm === undefined) ESTADO.ultimaSyncCompletaEm = 0;
+
+  const UM_DIA_MS = 24 * 60 * 60 * 1000;
 
   try {
     const tokenHiper = await gerarTokenHiper();
     const tokenShopify = await gerarTokenShopify();
 
     let produtos = [];
-    let ponto = 0;
     let pontoOriginal = ESTADO.pontoDeSincronizacao || 0;
-    let forcarCompleta = false;
+    let pontoRetornado;
+    let sincronizacaoCompleta = false;
+
+    const precisaSyncPeriodica = pontoOriginal !== 0 && (Date.now() - ESTADO.ultimaSyncCompletaEm > UM_DIA_MS);
 
     // ============================================================
-    // 1. BUSCA INTELIGENTE COM FALLBACK
+    // 1. BUSCA DE PRODUTOS
+    // ------------------------------------------------------------
+    // - ponto=0 (primeira execução) OU 24h+ sem uma sync completa:
+    //   busca tudo de uma vez, como rede de segurança periódica
+    //   (protege contra o caso de "sem novidades" na verdade
+    //   esconder um ponto realmente inválido/expirado no Hiper).
+    // - Caso contrário: busca incremental a partir do ponto salvo.
+    //   "Sem novidades" (ver hiper.js) NÃO conta como falha — só
+    //   erros de verdade (rede, autenticação, resposta inesperada)
+    //   entram no contador de 3 tentativas antes de forçar uma
+    //   sincronização completa de recuperação.
     // ============================================================
-    try {
-      const resposta = await buscarProdutosHiper(tokenHiper, pontoOriginal);
+    if (pontoOriginal === 0 || precisaSyncPeriodica) {
+      const motivo = pontoOriginal === 0
+        ? 'primeira execução'
+        : `mais de 24h sem sync completa (${((Date.now() - ESTADO.ultimaSyncCompletaEm) / 3600000).toFixed(1)}h)`;
+      console.log(`🔄 Buscando todos os produtos (ponto=0) — ${motivo}.`);
+      const resposta = await buscarProdutosHiper(tokenHiper, 0);
       produtos = resposta.produtos || [];
-      ponto = resposta.pontoDeSincronizacao;
-
-      if (!ponto && produtos.length > 0) {
-        ponto = pontoOriginal + produtos.length;
-      }
-
-      if (produtos.length === 0 && pontoOriginal !== 0) {
+      pontoRetornado = resposta.pontoDeSincronizacao;
+      sincronizacaoCompleta = true;
+      ESTADO.falhasPonto = 0;
+    } else {
+      try {
+        const resposta = await buscarProdutosHiper(tokenHiper, pontoOriginal);
+        produtos = resposta.produtos || [];
+        pontoRetornado = resposta.pontoDeSincronizacao;
+        ESTADO.falhasPonto = 0;
+        if (resposta.semNovidades) {
+          console.log(`ℹ️ Nada novo desde o ponto ${pontoOriginal}. Seguindo para checagem de pedidos.`);
+        }
+      } catch (erro) {
         ESTADO.falhasPonto = (ESTADO.falhasPonto || 0) + 1;
-        console.warn(`⚠️ Ponto ${pontoOriginal} retornou 0 produtos. Falhas: ${ESTADO.falhasPonto}/3`);
+        console.error(`❌ Erro ao buscar produtos: ${erro.message}. Falhas: ${ESTADO.falhasPonto}/3`);
 
-        if (ESTADO.falhasPonto >= 3) {
-          console.warn(`🔄 Forçando sincronização completa (ponto=0) após 3 falhas consecutivas.`);
-          forcarCompleta = true;
-        } else {
+        if (ESTADO.falhasPonto < 3) {
           console.log(`⏳ Tentativa ${ESTADO.falhasPonto}/3. Aguardando próxima execução.`);
           await salvarEstado(ESTADO);
           return;
         }
-      } else {
+
+        console.warn(`🔄 Forçando sincronização completa (ponto=0) após 3 erros consecutivos.`);
+        const resposta = await buscarProdutosHiper(tokenHiper, 0);
+        produtos = resposta.produtos || [];
+        pontoRetornado = resposta.pontoDeSincronizacao;
+        sincronizacaoCompleta = true;
         ESTADO.falhasPonto = 0;
       }
-    } catch (erro) {
-      ESTADO.falhasPonto = (ESTADO.falhasPonto || 0) + 1;
-      console.error(`❌ Erro ao buscar produtos: ${erro.message}. Falhas: ${ESTADO.falhasPonto}/3`);
-
-      if (ESTADO.falhasPonto >= 3) {
-        console.warn(`🔄 Forçando sincronização completa (ponto=0) após 3 erros consecutivos.`);
-        forcarCompleta = true;
-      } else {
-        await salvarEstado(ESTADO);
-        return;
-      }
     }
 
-    if (forcarCompleta) {
-      console.log(`🔄 Buscando todos os produtos (ponto=0)...`);
-      const resposta = await buscarProdutosHiper(tokenHiper, 0);
-      produtos = resposta.produtos || [];
-      ponto = resposta.pontoDeSincronizacao;
-      if (!ponto && produtos.length > 0) {
-        ponto = produtos.length; // calcula próximo ponto
-      }
-      ESTADO.falhasPonto = 0;
+    if (sincronizacaoCompleta) {
+      ESTADO.ultimaSyncCompletaEm = Date.now();
     }
 
-    if (produtos.length === 0) {
-      console.warn('⚠️ Nenhum produto encontrado no Hiper. Verifique a integração.');
-      await salvarEstado(ESTADO);
-      return;
+    if (produtos.length > 0) {
+      console.log(`✅ ${produtos.length} produtos encontrados no Hiper.`);
+    } else {
+      console.log('ℹ️ Nenhum produto para processar neste ciclo.');
     }
-
-    console.log(`✅ ${produtos.length} produtos encontrados no Hiper.`);
 
     // ============================================================
     // 2. ATUALIZA MAPA SKU
@@ -207,45 +228,55 @@ async function sincronizar() {
     const mapaSkuHiper = ESTADO.mapaSkuHiper;
 
     // ============================================================
-    // 3. IDENTIFICAR PRODUTOS ATIVOS (para arquivamento)
-    // ============================================================
-    const idsAtivos = new Set();
-    for (const produto of produtos) {
-      if (!produto.removido && produto.ativo) {
-        idsAtivos.add(produto.id);
-      }
-    }
-
-    // ============================================================
-    // 4. ARQUIVAR PRODUTOS QUE NÃO ESTÃO MAIS NO HIPER
+    // 3. ARQUIVAMENTO
+    // ------------------------------------------------------------
+    // O endpoint incremental só devolve o que MUDOU desde o último
+    // ponto — não a lista completa de produtos ativos. Por isso só
+    // podemos comparar "mapa inteiro x retornados" (e arquivar quem
+    // sumiu) numa sincronização COMPLETA. Numa incremental,
+    // arquivamos apenas quem veio no próprio lote marcado como
+    // removido/inativo — nunca por ausência na lista, porque a
+    // ausência aí não significa que o produto sumiu, só que ele não
+    // mudou desde o último ponto.
     // ============================================================
     let arquivados = 0;
-    const mapaAtual = { ...ESTADO.produtosMap };
-    for (const [hiperId, mapaEntry] of Object.entries(mapaAtual)) {
-      if (!idsAtivos.has(hiperId)) {
-        try {
-          console.log(`🗑️ Produto ${hiperId} não está mais ativo no Hiper. Arquivando na Shopify...`);
-          const shopifyId = mapaEntry.shopifyId;
-          await arquivarProdutoShopify(tokenShopify, shopifyId);
-          delete ESTADO.produtosMap[hiperId];
-          arquivados++;
-        } catch (erro) {
-          console.error(`❌ Erro ao arquivar produto ${hiperId}:`, erro.message);
+
+    if (sincronizacaoCompleta) {
+      if (produtos.length === 0) {
+        console.warn('⚠️ Sincronização completa retornou 0 produtos — isso é incomum. Por segurança, nada será arquivado neste ciclo (evita apagar o catálogo inteiro por engano). Vale checar a integração com o Hiper se isso persistir.');
+      } else {
+        const idsAtivos = new Set();
+        for (const produto of produtos) {
+          if (!produto.removido && produto.ativo) idsAtivos.add(produto.id);
         }
-        await sleep(300);
+        const mapaAtual = { ...ESTADO.produtosMap };
+        for (const hiperId of Object.keys(mapaAtual)) {
+          if (!idsAtivos.has(hiperId)) {
+            const ok = await arquivarSeMapeado(tokenShopify, ESTADO, hiperId, 'não está mais ativo no Hiper (sync completa)');
+            if (ok) arquivados++;
+            await sleep(300);
+          }
+        }
+      }
+    } else {
+      for (const produto of produtos) {
+        if (produto.removido || !produto.ativo) {
+          const ok = await arquivarSeMapeado(tokenShopify, ESTADO, produto.id, 'foi marcado como removido/inativo no Hiper');
+          if (ok) arquivados++;
+          await sleep(300);
+        }
       }
     }
 
     // ============================================================
-    // 5. CRIAR/ATUALIZAR PRODUTOS ATIVOS
+    // 4. CRIAR/ATUALIZAR PRODUTOS ATIVOS
     // ============================================================
     let criados = 0;
     let atualizados = 0;
-
-    console.log('\n🚀 Criando/atualizando produtos...');
+    if (produtos.length > 0) console.log('\n🚀 Criando/atualizando produtos...');
 
     for (const produto of produtos) {
-      if (produto.removido || !produto.ativo) continue;
+      if (produto.removido || !produto.ativo) continue; // já tratado no arquivamento acima
       if (produto.produtoPrimarioId && produto.produtoPrimarioId !== '00000000-0000-0000-0000-000000000000') continue;
 
       try {
@@ -259,7 +290,6 @@ async function sincronizar() {
         }
 
         const mapaEntry = ESTADO.produtosMap[produto.id];
-
         if (mapaEntry) {
           console.log(`📦 Produto "${produto.nome}" já mapeado (Shopify ID: ${mapaEntry.shopifyId}). Atualizando...`);
           const produtoExistente = mapaParaProdutoExistente(mapaEntry);
@@ -273,7 +303,6 @@ async function sincronizar() {
           if (!existe) {
             existe = await buscarProdutoPorSKU(tokenShopify, sku);
           }
-
           if (existe) {
             console.log(`📦 Produto "${produto.nome}" encontrado via busca (SKU: ${sku}). Atualizando e mapeando...`);
             const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe);
@@ -290,7 +319,6 @@ async function sincronizar() {
             }
           }
         }
-
         await salvarEstado(ESTADO);
       } catch (erro) {
         console.error(`❌ Erro ao processar "${produto.nome}":`, erro.message);
@@ -299,36 +327,23 @@ async function sincronizar() {
     }
 
     // ============================================================
-    // 6. ATUALIZA PONTO DE SINCRONIZAÇÃO (CORRIGIDO)
+    // 5. ATUALIZA PONTO DE SINCRONIZAÇÃO
+    // ------------------------------------------------------------
+    // Regra única: confiamos sempre no valor que o HIPER devolveu.
+    // Nunca recalculamos localmente (ex: com produtos.length) e
+    // nunca bloqueamos a atualização comparando com o valor antigo
+    // — o ponto é um cursor controlado pelo Hiper, não um contador
+    // nosso, então um valor "menor" não é necessariamente retrocesso.
     // ============================================================
-    if (produtos.length > 0) {
-      let novoPonto = ponto;
-      // Se foi sync completa (ponto=0), calculamos o próximo ponto como total de produtos ativos
-      if (forcarCompleta || pontoOriginal === 0) {
-        // O ponto deve ser o número de produtos processados (offset)
-        novoPonto = idsAtivos.size; // ou produtos.length, mas idsAtivos pode ser menor se houver inativos
-        // Mas atenção: o ponto normalmente é um offset que começa em 0 e vai incrementando.
-        // Se começamos do 0 e processamos N produtos, o próximo ponto é N.
-        // Vamos usar produtos.length, que é o total retornado (incluindo inativos? 
-        // A API retorna todos, então produtos.length é o número total retornado.
-        // Para simplificar, usamos produtos.length.
-        novoPonto = produtos.length;
-        console.log(`📌 Sincronização completa: calculando novo ponto como ${novoPonto} (${produtos.length} produtos retornados).`);
-      } else if (ponto && !isNaN(ponto) && ponto >= 0) {
-        novoPonto = ponto;
+    if (pontoRetornado !== undefined && pontoRetornado !== null && !isNaN(pontoRetornado)) {
+      if (pontoRetornado !== ESTADO.pontoDeSincronizacao) {
+        console.log(`📌 Ponto de sincronização: ${ESTADO.pontoDeSincronizacao} → ${pontoRetornado}`);
+        ESTADO.pontoDeSincronizacao = pontoRetornado;
       } else {
-        novoPonto = ESTADO.pontoDeSincronizacao;
-      }
-
-      // Garantir que o novo ponto seja maior que o antigo (evitar retrocessos)
-      if (novoPonto > ESTADO.pontoDeSincronizacao) {
-        ESTADO.pontoDeSincronizacao = novoPonto;
-        console.log(`📌 Ponto de sincronização atualizado para ${novoPonto}`);
-      } else {
-        console.log(`📌 Ponto atual (${ESTADO.pontoDeSincronizacao}) mantido.`);
+        console.log(`📌 Ponto de sincronização inalterado (${pontoRetornado}).`);
       }
     } else {
-      console.log(`📌 Nenhum produto processado. Ponto NÃO alterado.`);
+      console.warn('⚠️ Hiper não retornou um pontoDeSincronizacao válido nesta chamada — mantendo o valor atual.');
     }
 
     console.log(`\n--- SINC. PRODUTOS CONCLUÍDA ---`);
@@ -337,12 +352,12 @@ async function sincronizar() {
     console.log(`🗑️ ${arquivados} produtos ARQUIVADOS (removidos do Hiper).`);
 
     // ============================================================
-    // 7. SALVA ESTADO (antes dos pedidos)
+    // 6. SALVA ESTADO (antes dos pedidos)
     // ============================================================
     await salvarEstado(ESTADO);
 
     // ============================================================
-    // 8. PEDIDOS
+    // 7. PEDIDOS (sempre roda, mesmo em ciclos sem novidade de produto)
     // ============================================================
     const pedidos = await buscarPedidosShopify(tokenShopify, ESTADO.ultimoPedidoId || 0);
     let enviados = 0;
@@ -360,7 +375,6 @@ async function sincronizar() {
       }
       await sleep(300);
     }
-
     console.log(`\n--- SINC. PEDIDOS CONCLUÍDA ---`);
     console.log(`📦 ${enviados} pedidos enviados para o Hiper.`);
 
@@ -378,7 +392,6 @@ async function sincronizar() {
 
     await salvarEstado(ESTADO);
     console.log(`\n✅ ESTADO SALVO NO UPSTASH (${Object.keys(ESTADO.produtosMap).length} produtos mapeados).`);
-
   } catch (erro) {
     console.error('❌ ERRO NA SINCRONIZAÇÃO:', erro.message);
     await salvarEstado(ESTADO).catch(() => {});
