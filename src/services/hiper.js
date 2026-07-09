@@ -16,6 +16,19 @@ function gerarTokenHiper() {
   });
 }
 
+// ============================================================
+// BUSCA PRODUTOS — COM DISTINÇÃO ENTRE "SEM NOVIDADES" E ERRO REAL
+// ------------------------------------------------------------
+// O endpoint de pontoDeSincronizacao do Hiper devolve um "erro"
+// ("Nenhum produto encontrado") quando não há nada de novo a partir
+// do ponto informado. Isso NÃO é uma falha da integração — é o
+// resultado normal na maioria dos ciclos (a loja nem sempre tem
+// produto alterado a cada 10 minutos). Por isso essa mensagem
+// específica é tratada como "sem novidades" (sucesso, lista vazia).
+// Qualquer OUTRA mensagem de erro continua sendo lançada como
+// exceção de verdade, pra acionar o mecanismo de retry/recuperação
+// em sync.js.
+// ============================================================
 function buscarProdutosHiper(token, pontoSinc) {
   console.log(`🔄 Buscando produtos do Hiper (ponto: ${pontoSinc})...`);
   const opcoes = {
@@ -25,8 +38,27 @@ function buscarProdutosHiper(token, pontoSinc) {
     headers: { 'Authorization': `Bearer ${token}` }
   };
   return request(opcoes).then(res => {
-    if (res.errors && res.errors.length) throw new Error(res.errors.join(', '));
+    const mensagensErro = Array.isArray(res.errors) ? res.errors.join(', ') : '';
+
+    if (mensagensErro && /nenhum produto encontrado/i.test(mensagensErro)) {
+      console.log(`ℹ️ Hiper: nenhuma novidade a partir do ponto ${pontoSinc}.`);
+      return {
+        produtos: [],
+        // Se o Hiper não mandar um novo ponto junto do "sem novidades",
+        // mantemos o ponto atual — não há motivo pra mudá-lo.
+        pontoDeSincronizacao: (res.pontoDeSincronizacao !== undefined && res.pontoDeSincronizacao !== null)
+          ? res.pontoDeSincronizacao
+          : pontoSinc,
+        semNovidades: true
+      };
+    }
+
+    if (res.errors && res.errors.length) {
+      throw new Error(mensagensErro || 'Erro desconhecido ao buscar produtos no Hiper');
+    }
+
     console.log(`✅ ${res.produtos?.length || 0} produtos encontrados no Hiper`);
+    console.log(`🔎 pontoDeSincronizacao retornado pelo Hiper: ${res.pontoDeSincronizacao}`);
 
     // ============================================================
     // LOG DE DIAGNÓSTICO PARA A BLUSA ASTER
@@ -43,13 +75,16 @@ function buscarProdutosHiper(token, pontoSinc) {
     }
     // ============================================================
 
-    return res;
+    return {
+      produtos: res.produtos || [],
+      pontoDeSincronizacao: res.pontoDeSincronizacao,
+      semNovidades: false
+    };
   });
 }
 
 function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
   console.log(`🔄 Enviando pedido #${pedidoShopify.order_number} para o Hiper...`);
-
   const cliente = {
     documento: '00000000000',
     email: pedidoShopify.email || pedidoShopify.customer?.email || 'cliente@email.com',
@@ -57,12 +92,10 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
     nomeDoCliente: pedidoShopify.customer?.first_name + ' ' + pedidoShopify.customer?.last_name || 'Cliente',
     nomeFantasia: ''
   };
-
   if (pedidoShopify.note_attributes) {
     const cpfAttr = pedidoShopify.note_attributes.find(a => a.name === 'cpf' || a.name === 'documento');
     if (cpfAttr) cliente.documento = cpfAttr.value.replace(/\D/g, '');
   }
-
   const shipping = pedidoShopify.shipping_address || {};
   const enderecoEntrega = {
     bairro: shipping.city || '',
@@ -72,7 +105,6 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
     logradouro: shipping.address1 || '',
     numero: '0'
   };
-
   const billing = pedidoShopify.billing_address || shipping;
   const enderecoCobranca = {
     bairro: billing.city || '',
@@ -82,7 +114,6 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
     logradouro: billing.address1 || '',
     numero: '0'
   };
-
   const itens = [];
   for (const item of pedidoShopify.line_items || []) {
     const sku = item.sku || '';
@@ -98,24 +129,20 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
       precoUnitarioLiquido: parseFloat(item.price) || 0
     });
   }
-
   if (itens.length === 0) {
     console.warn(`⚠️ Pedido #${pedidoShopify.order_number} não tem itens válidos. Ignorando.`);
     return Promise.resolve(null);
   }
-
   const total = parseFloat(pedidoShopify.total_price) || 0;
   const meiosPagamento = [{
     idMeioDePagamento: 4,
     parcelas: 1,
     valor: total
   }];
-
   let valorFrete = 0;
   if (pedidoShopify.shipping_lines && pedidoShopify.shipping_lines.length > 0) {
     valorFrete = parseFloat(pedidoShopify.shipping_lines[0].price) || 0;
   }
-
   const payloadHiper = {
     cliente: cliente,
     enderecoDeCobranca: enderecoCobranca,
@@ -130,7 +157,6 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
       Nome: 'Shopify'
     }
   };
-
   const opcoes = {
     hostname: 'ms-ecommerce.hiper.com.br',
     path: '/api/v1/pedido-de-venda/',
@@ -140,7 +166,6 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
       'Authorization': `Bearer ${tokenHiper}`
     }
   };
-
   return request(opcoes, JSON.stringify(payloadHiper)).then(res => {
     if (res.errors && res.errors.length > 0) throw new Error(res.errors.join(', '));
     console.log(`✅ Pedido #${pedidoShopify.order_number} enviado para o Hiper! ID: ${res.id}`);
