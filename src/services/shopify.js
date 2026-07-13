@@ -474,6 +474,26 @@ function buscarCpfCnpjDoPedido(token, orderId) {
 }
 
 // ============================================================
+// BUSCA UM PEDIDO ESPECÍFICO POR ID (usado no retry de pedidos
+// que falharam ao enviar pro Hiper)
+// ============================================================
+function buscarPedidoPorIdShopify(token, orderId) {
+  const opcoes = {
+    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+    path: `/admin/api/2026-07/orders/${orderId}.json`,
+    method: 'GET',
+    headers: { 'X-Shopify-Access-Token': token }
+  };
+  return request(opcoes).then(res => {
+    if (res.errors) throw new Error(JSON.stringify(res.errors));
+    return res.order || null;
+  }).catch(err => {
+    console.warn(`⚠️ Erro ao buscar pedido ${orderId} na Shopify: ${err.message}`);
+    return null;
+  });
+}
+
+// ============================================================
 // BUSCAR PEDIDOS NOVOS
 // ============================================================
 function buscarPedidosShopify(token, sinceId = 0) {
@@ -561,6 +581,7 @@ module.exports = {
   buscarDadosAtuaisProdutoShopify,
   buscarCpfCnpjDoPedido,
   buscarPedidosShopify,
+  buscarPedidoPorIdShopify,
   buscarPedidosCanceladosShopify,
   adicionarTagAoPedidoShopify,
   sleep
