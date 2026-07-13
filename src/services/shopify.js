@@ -424,6 +424,56 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente, op
 }
 
 // ============================================================
+// BUSCA O CPF/CNPJ DE UM PEDIDO (CAMPO NATIVO DO CHECKOUT BR)
+// ------------------------------------------------------------
+// Quando o CPF/CNPJ é coletado pela configuração nativa da Shopify
+// (Configurações > Finalização de compra > Brasil), esse valor
+// NÃO aparece na API REST de pedidos — só é exposto via GraphQL,
+// dentro de "localizationExtensions". Por isso essa busca é
+// separada da REST e feita sob demanda por pedido.
+// ============================================================
+function buscarCpfCnpjDoPedido(token, orderId) {
+  const query = `{
+    order(id: "gid://shopify/Order/${orderId}") {
+      localizationExtensions(first: 10) {
+        edges {
+          node {
+            countryCode
+            purpose
+            title
+            value
+          }
+        }
+      }
+    }
+  }`;
+  const opcoes = {
+    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+    path: '/admin/api/2026-07/graphql.json',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': token
+    }
+  };
+  return request(opcoes, JSON.stringify({ query })).then(res => {
+    if (res.errors) throw new Error(JSON.stringify(res.errors));
+    const edges = res.data?.order?.localizationExtensions?.edges || [];
+    const campo = edges.find(e => {
+      const n = e.node;
+      return n.title === 'CPF/CNPJ'
+        || n.purpose === 'TAX'
+        || n.purpose === 'TAX_CREDENTIAL_BR'
+        || n.purpose === 'SHIPPING_CREDENTIAL_BR';
+    });
+    return campo ? (campo.node.value || '').replace(/\D/g, '') : null;
+  }).catch(err => {
+    console.warn(`⚠️ Erro ao buscar CPF/CNPJ do pedido ${orderId} via GraphQL: ${err.message}`);
+    return null;
+  });
+}
+
+// ============================================================
 // BUSCAR PEDIDOS NOVOS
 // ============================================================
 function buscarPedidosShopify(token, sinceId = 0) {
@@ -509,6 +559,7 @@ module.exports = {
   atualizarProdutoShopify,
   arquivarProdutoShopify,
   buscarDadosAtuaisProdutoShopify,
+  buscarCpfCnpjDoPedido,
   buscarPedidosShopify,
   buscarPedidosCanceladosShopify,
   adicionarTagAoPedidoShopify,
