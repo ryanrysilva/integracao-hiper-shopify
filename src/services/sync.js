@@ -13,6 +13,7 @@ const {
   buscarDadosAtuaisProdutoShopify,
   buscarCpfCnpjDoPedido,
   buscarPedidosShopify,
+  buscarPedidoPorIdShopify,
   buscarPedidosCanceladosShopify,
   adicionarTagAoPedidoShopify,
   sleep
@@ -139,6 +140,77 @@ async function arquivarSeMapeado(tokenShopify, ESTADO, hiperId, motivo) {
 }
 
 // ============================================================
+// TENTA ENVIAR UM PEDIDO AO HIPER
+// ------------------------------------------------------------
+// Centraliza a lógica de resolução (CPF, IBGE, forma de pagamento)
+// e o envio em si. Usada tanto para pedidos novos quanto para
+// retry de pedidos que falharam em ciclos anteriores.
+// Retorna true se enviou com sucesso (ou se não havia nada a
+// enviar, ex: pedido já cancelado), false se falhou.
+// ============================================================
+async function tentarEnviarPedido(tokenHiper, tokenShopify, ESTADO, mapaSkuHiper, pedido) {
+  if (pedido.cancelled_at) {
+    console.log(`⏭️ Pedido #${pedido.order_number} já está cancelado na Shopify. Não enviando ao Hiper.`);
+    delete ESTADO.pedidosComErro[pedido.id];
+    return true;
+  }
+
+  try {
+    const enderecoEntrega = pedido.shipping_address;
+    const enderecoCobranca = pedido.billing_address || enderecoEntrega;
+
+    const [codigoIbgeEntrega, codigoIbgeCobranca, documentoCliente] = await Promise.all([
+      obterCodigoIbge(enderecoEntrega?.province_code, enderecoEntrega?.city),
+      obterCodigoIbge(enderecoCobranca?.province_code, enderecoCobranca?.city),
+      buscarCpfCnpjDoPedido(tokenShopify, pedido.id)
+    ]);
+    const idMeioDePagamento = mapearMeioDePagamento(pedido);
+
+    console.log(`🔎 Pedido #${pedido.order_number}: documento resolvido = "${documentoCliente || '(não encontrado)'}" | IBGE entrega = ${codigoIbgeEntrega || '(não resolvido)'} | IBGE cobrança = ${codigoIbgeCobranca || '(não resolvido)'} | meio de pagamento = ${idMeioDePagamento}`);
+
+    if (!codigoIbgeEntrega || !documentoCliente) {
+      console.warn(`⚠️ Pedido #${pedido.order_number}: dado incompleto (${!documentoCliente ? 'sem CPF/CNPJ' : ''}${!documentoCliente && !codigoIbgeEntrega ? ' + ' : ''}${!codigoIbgeEntrega ? 'IBGE não resolvido' : ''}). O Hiper pode rejeitar — se rejeitar, vai entrar na fila de retry.`);
+    }
+
+    const resultado = await enviarPedidoParaHiper(tokenHiper, pedido, mapaSkuHiper, {
+      documentoCliente,
+      idMeioDePagamento,
+      codigoIbgeEntrega,
+      codigoIbgeCobranca
+    });
+
+    if (!resultado) return false;
+
+    ESTADO.pedidosMap[pedido.id] = {
+      hiperPedidoId: resultado.id,
+      orderNumber: pedido.order_number,
+      cancelado: false,
+      faturado: false,
+      enviadoEm: Date.now()
+    };
+
+    if (ESTADO.pedidosComErro[pedido.id]) {
+      delete ESTADO.pedidosComErro[pedido.id];
+      await adicionarTagAoPedidoShopify(tokenShopify, pedido.id, 'Hiper-Enviado');
+    }
+    return true;
+  } catch (erro) {
+    console.error(`❌ Erro ao enviar pedido #${pedido.order_number}:`, erro.message);
+    const existente = ESTADO.pedidosComErro[pedido.id] || {
+      orderNumber: pedido.order_number,
+      tentativas: 0,
+      primeiraTentativaEm: Date.now()
+    };
+    existente.tentativas += 1;
+    existente.ultimoErro = erro.message;
+    existente.ultimaTentativaEm = Date.now();
+    ESTADO.pedidosComErro[pedido.id] = existente;
+    await adicionarTagAoPedidoShopify(tokenShopify, pedido.id, 'Hiper-Erro-Envio');
+    return false;
+  }
+}
+
+// ============================================================
 // FUNÇÃO PRINCIPAL DE SINCRONIZAÇÃO
 // ============================================================
 async function sincronizar() {
@@ -147,11 +219,13 @@ async function sincronizar() {
   if (ESTADO.falhasPonto === undefined) ESTADO.falhasPonto = 0;
   if (ESTADO.ultimaSyncCompletaEm === undefined) ESTADO.ultimaSyncCompletaEm = 0;
   if (ESTADO.pedidosMap === undefined) ESTADO.pedidosMap = {};
+  if (ESTADO.pedidosComErro === undefined) ESTADO.pedidosComErro = {};
   if (ESTADO.ultimaChecagemCancelamentoEm === undefined) ESTADO.ultimaChecagemCancelamentoEm = 0;
 
   const UM_DIA_MS = 24 * 60 * 60 * 1000;
   const TRINTA_DIAS_MS = 30 * UM_DIA_MS;
   const MAX_CONSULTAS_POR_CICLO = 20;
+  const MAX_TENTATIVAS_PEDIDO = 5;
 
   try {
     const tokenHiper = await gerarTokenHiper();
@@ -389,56 +463,18 @@ async function sincronizar() {
     // ============================================================
     // 6. PEDIDOS NOVOS (Shopify → Hiper)
     // ------------------------------------------------------------
-    // Resolve CPF/CNPJ, forma de pagamento e código IBGE reais
-    // antes de enviar. Salva o progresso a CADA pedido processado
-    // (não só no fim do lote) para não reenviar em duplicidade se
-    // o processo cair no meio do caminho.
+    // Salva o progresso a CADA pedido processado (não só no fim do
+    // lote) para não reenviar em duplicidade se o processo cair no
+    // meio do caminho. Pedidos que falharem NÃO ficam perdidos —
+    // entram em ESTADO.pedidosComErro e são tentados de novo no
+    // passo 6b, em ciclos futuros.
     // ============================================================
     const pedidos = await buscarPedidosShopify(tokenShopify, ESTADO.ultimoPedidoId || 0);
     let enviados = 0;
 
     for (const pedido of pedidos) {
-      try {
-        if (pedido.cancelled_at) {
-          console.log(`⏭️ Pedido #${pedido.order_number} já está cancelado na Shopify. Não enviando ao Hiper.`);
-        } else {
-          const enderecoEntrega = pedido.shipping_address;
-          const enderecoCobranca = pedido.billing_address || enderecoEntrega;
-
-          const [codigoIbgeEntrega, codigoIbgeCobranca, documentoCliente] = await Promise.all([
-            obterCodigoIbge(enderecoEntrega?.province_code, enderecoEntrega?.city),
-            obterCodigoIbge(enderecoCobranca?.province_code, enderecoCobranca?.city),
-            buscarCpfCnpjDoPedido(tokenShopify, pedido.id)
-          ]);
-          const idMeioDePagamento = mapearMeioDePagamento(pedido);
-
-          console.log(`🔎 Pedido #${pedido.order_number}: documento resolvido = "${documentoCliente || '(não encontrado)'}" | IBGE entrega = ${codigoIbgeEntrega || '(não resolvido)'} | IBGE cobrança = ${codigoIbgeCobranca || '(não resolvido)'} | meio de pagamento = ${idMeioDePagamento}`);
-
-          if (!codigoIbgeEntrega || !documentoCliente) {
-            console.warn(`⚠️ Pedido #${pedido.order_number}: ${!documentoCliente ? 'CPF/CNPJ não encontrado' : ''}${!documentoCliente && !codigoIbgeEntrega ? ' e ' : ''}${!codigoIbgeEntrega ? `código IBGE não resolvido para "${enderecoEntrega?.city}/${enderecoEntrega?.province_code}"` : ''}. O Hiper provavelmente vai rejeitar este pedido — verifique manualmente se persistir.`);
-          }
-
-          const resultado = await enviarPedidoParaHiper(tokenHiper, pedido, mapaSkuHiper, {
-            documentoCliente,
-            idMeioDePagamento,
-            codigoIbgeEntrega,
-            codigoIbgeCobranca
-          });
-
-          if (resultado) {
-            enviados++;
-            ESTADO.pedidosMap[pedido.id] = {
-              hiperPedidoId: resultado.id,
-              orderNumber: pedido.order_number,
-              cancelado: false,
-              faturado: false,
-              enviadoEm: Date.now()
-            };
-          }
-        }
-      } catch (erro) {
-        console.error(`❌ Erro ao enviar pedido #${pedido.order_number}:`, erro.message);
-      }
+      const ok = await tentarEnviarPedido(tokenHiper, tokenShopify, ESTADO, mapaSkuHiper, pedido);
+      if (ok && ESTADO.pedidosMap[pedido.id]) enviados++;
 
       if (pedido.id > (ESTADO.ultimoPedidoId || 0)) {
         ESTADO.ultimoPedidoId = pedido.id;
@@ -448,6 +484,40 @@ async function sincronizar() {
     }
     console.log(`\n--- SINC. PEDIDOS CONCLUÍDA ---`);
     console.log(`📦 ${enviados} pedidos enviados para o Hiper.`);
+
+    // ============================================================
+    // 6b. RETRY DE PEDIDOS QUE FALHARAM EM CICLOS ANTERIORES
+    // ------------------------------------------------------------
+    // Esses pedidos já passaram pelo since_id (não vão aparecer de
+    // novo em "pedidos novos"), então precisam ser buscados por ID
+    // individualmente. Para de tentar automaticamente depois de
+    // MAX_TENTATIVAS_PEDIDO — a tag "Hiper-Erro-Envio" continua na
+    // Shopify pra você resolver manualmente.
+    // ============================================================
+    const idsComErro = Object.keys(ESTADO.pedidosComErro)
+      .filter(id => ESTADO.pedidosComErro[id].tentativas < MAX_TENTATIVAS_PEDIDO);
+
+    if (idsComErro.length > 0) {
+      console.log(`\n🔁 Tentando reenviar ${idsComErro.length} pedido(s) com erro de ciclos anteriores...`);
+    }
+
+    for (const shopifyOrderId of idsComErro) {
+      try {
+        const pedido = await buscarPedidoPorIdShopify(tokenShopify, shopifyOrderId);
+        if (!pedido) continue;
+        const ok = await tentarEnviarPedido(tokenHiper, tokenShopify, ESTADO, mapaSkuHiper, pedido);
+        if (ok) enviados++;
+      } catch (erro) {
+        console.error(`❌ Erro ao tentar reenviar pedido ${shopifyOrderId}:`, erro.message);
+      }
+      await salvarEstado(ESTADO);
+      await sleep(300);
+    }
+
+    const esgotados = Object.values(ESTADO.pedidosComErro).filter(p => p.tentativas >= MAX_TENTATIVAS_PEDIDO).length;
+    if (esgotados > 0) {
+      console.warn(`⚠️ ${esgotados} pedido(s) esgotaram as ${MAX_TENTATIVAS_PEDIDO} tentativas automáticas e precisam de correção manual (veja a tag "Hiper-Erro-Envio" na Shopify).`);
+    }
 
     // ============================================================
     // 7. CANCELAMENTOS NA SHOPIFY → PROPAGA PRO HIPER
@@ -512,7 +582,7 @@ async function sincronizar() {
     }
 
     await salvarEstado(ESTADO);
-    console.log(`\n✅ ESTADO SALVO NO UPSTASH (${Object.keys(ESTADO.produtosMap).length} produtos mapeados, ${Object.keys(ESTADO.pedidosMap).length} pedidos rastreados).`);
+    console.log(`\n✅ ESTADO SALVO NO UPSTASH (${Object.keys(ESTADO.produtosMap).length} produtos mapeados, ${Object.keys(ESTADO.pedidosMap).length} pedidos rastreados, ${Object.keys(ESTADO.pedidosComErro).length} pedidos com erro pendente).`);
   } catch (erro) {
     console.error('❌ ERRO NA SINCRONIZAÇÃO:', erro.message);
     await salvarEstado(ESTADO).catch(() => {});
