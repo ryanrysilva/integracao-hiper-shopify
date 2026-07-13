@@ -42,11 +42,15 @@ function buscarProdutosHiper(token, pontoSinc) {
 
     if (mensagensErro && /nenhum produto encontrado/i.test(mensagensErro)) {
       console.log(`ℹ️ Hiper: nenhuma novidade a partir do ponto ${pontoSinc}.`);
+      // Importante: NÃO confiamos em res.pontoDeSincronizacao aqui. Numa
+      // resposta de "sem novidades" o Hiper costuma devolver esse campo
+      // zerado (é um payload de erro, não um cursor de verdade) — usar
+      // "??" deixaria esse 0 passar e resetaria o ponto de sincronização
+      // real. Em "sem novidades" o ponto correto é sempre o mesmo que já
+      // tínhamos.
       return {
         produtos: [],
-        pontoDeSincronizacao: (res.pontoDeSincronizacao !== undefined && res.pontoDeSincronizacao !== null)
-          ? res.pontoDeSincronizacao
-          : pontoSinc,
+        pontoDeSincronizacao: pontoSinc,
         semNovidades: true
       };
     }
