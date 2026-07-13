@@ -11,6 +11,7 @@ const {
   atualizarProdutoShopify,
   arquivarProdutoShopify,
   buscarDadosAtuaisProdutoShopify,
+  buscarCpfCnpjDoPedido,
   buscarPedidosShopify,
   buscarPedidosCanceladosShopify,
   adicionarTagAoPedidoShopify,
@@ -404,13 +405,19 @@ async function sincronizar() {
           const enderecoEntrega = pedido.shipping_address;
           const enderecoCobranca = pedido.billing_address || enderecoEntrega;
 
-          const [codigoIbgeEntrega, codigoIbgeCobranca] = await Promise.all([
+          const [codigoIbgeEntrega, codigoIbgeCobranca, documentoCliente] = await Promise.all([
             obterCodigoIbge(enderecoEntrega?.province_code, enderecoEntrega?.city),
-            obterCodigoIbge(enderecoCobranca?.province_code, enderecoCobranca?.city)
+            obterCodigoIbge(enderecoCobranca?.province_code, enderecoCobranca?.city),
+            buscarCpfCnpjDoPedido(tokenShopify, pedido.id)
           ]);
           const idMeioDePagamento = mapearMeioDePagamento(pedido);
 
+          if (!codigoIbgeEntrega || !documentoCliente) {
+            console.warn(`⚠️ Pedido #${pedido.order_number}: ${!documentoCliente ? 'CPF/CNPJ não encontrado' : ''}${!documentoCliente && !codigoIbgeEntrega ? ' e ' : ''}${!codigoIbgeEntrega ? `código IBGE não resolvido para "${enderecoEntrega?.city}/${enderecoEntrega?.province_code}"` : ''}. O Hiper provavelmente vai rejeitar este pedido — verifique manualmente se persistir.`);
+          }
+
           const resultado = await enviarPedidoParaHiper(tokenHiper, pedido, mapaSkuHiper, {
+            documentoCliente,
             idMeioDePagamento,
             codigoIbgeEntrega,
             codigoIbgeCobranca
