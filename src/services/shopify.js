@@ -134,11 +134,25 @@ function arquivarProdutoShopify(token, productId) {
 }
 
 // ============================================================
-// CRIAR PRODUTO (COM METAFIELD)
+// MONTA A LISTA DE IMAGENS NO FORMATO DA API DE PRODUTOS
+// ============================================================
+function montarImagensShopify(produtoHiper) {
+  const imagens = [];
+  if (produtoHiper.imagem) imagens.push({ src: produtoHiper.imagem });
+  if (Array.isArray(produtoHiper.imagensAdicionais)) {
+    produtoHiper.imagensAdicionais.forEach(img => {
+      const url = (img && typeof img === 'object') ? img.imagem : img;
+      if (url) imagens.push({ src: url });
+    });
+  }
+  return imagens;
+}
+
+// ============================================================
+// CRIAR PRODUTO (COM METAFIELD E IMAGENS)
 // ============================================================
 function criarProdutoShopify(token, produtoHiper) {
   console.log(`🔄 CRIANDO produto "${produtoHiper.nome}" na Shopify...`);
-
   let sku = produtoHiper.codigoDeBarras || `SKU-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
   const hiperId = produtoHiper.id;
   const produtoShopify = {
@@ -161,14 +175,16 @@ function criarProdutoShopify(token, produtoHiper) {
     }
   };
 
+  const imagens = montarImagensShopify(produtoHiper);
+  if (imagens.length > 0) produtoShopify.product.images = imagens;
+
   if (produtoHiper.variacao && produtoHiper.variacao.length > 0) {
     console.log(`🔁 Criando produto com ${produtoHiper.variacao.length} variações.`);
     const tipoVariacaoA = produtoHiper.variacao[0]?.tipoVariacaoA || 'Opção 1';
     const tipoVariacaoB = produtoHiper.variacao[0]?.tipoVariacaoB || null;
-    const opcoes = [{ name: tipoVariacaoA }];
-    if (tipoVariacaoB) opcoes.push({ name: tipoVariacaoB });
-    produtoShopify.product.options = opcoes;
-
+    const opcoesVariacao = [{ name: tipoVariacaoA }];
+    if (tipoVariacaoB) opcoesVariacao.push({ name: tipoVariacaoB });
+    produtoShopify.product.options = opcoesVariacao;
     produtoHiper.variacao.forEach((variacao, idx) => {
       const varSku = variacao.codigoDeBarras || `${sku}-V${idx + 1}`;
       const variant = {
@@ -191,7 +207,6 @@ function criarProdutoShopify(token, produtoHiper) {
       option1: produtoHiper.nome
     });
   }
-
   const opcoes = {
     hostname: `${CONFIG.shopify.loja}.myshopify.com`,
     path: '/admin/api/2026-07/products.json',
@@ -212,15 +227,33 @@ function criarProdutoShopify(token, produtoHiper) {
 }
 
 // ============================================================
-// CACHE DE LOCATION + ATUALIZAR ESTOQUE (NOVA VERSÃO)
+// BUSCA OS DADOS ATUAIS DE UM PRODUTO NA SHOPIFY
+// ------------------------------------------------------------
+// Usado antes de atualizar, pra decidir se a descrição/imagens
+// foram editadas manualmente e não devem ser sobrescritas.
 // ============================================================
+function buscarDadosAtuaisProdutoShopify(token, productId) {
+  const opcoes = {
+    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+    path: `/admin/api/2026-07/products/${productId}.json?fields=body_html,images`,
+    method: 'GET',
+    headers: { 'X-Shopify-Access-Token': token }
+  };
+  return request(opcoes).then(res => {
+    if (res.errors) throw new Error(JSON.stringify(res.errors));
+    return {
+      body_html: res.product?.body_html || '',
+      images: res.product?.images || []
+    };
+  });
+}
 
-// Cache do location — evita bater na API a cada variante
+// ============================================================
+// CACHE DE LOCATION + ATUALIZAR ESTOQUE
+// ============================================================
 let _locationIdCache = null;
-
 async function obterLocationId(token) {
   if (_locationIdCache) return _locationIdCache;
-
   const opcoes = {
     hostname: `${CONFIG.shopify.loja}.myshopify.com`,
     path: '/admin/api/2026-07/locations.json',
@@ -228,14 +261,12 @@ async function obterLocationId(token) {
     headers: { 'X-Shopify-Access-Token': token }
   };
   const res = await request(opcoes);
-
   if (res.errors) {
     throw new Error(`Erro ao buscar locations: ${JSON.stringify(res.errors)}`);
   }
   if (!res.locations || res.locations.length === 0) {
     throw new Error('Nenhum location retornado pela Shopify. Verifique se o app tem o scope "read_locations" habilitado.');
   }
-
   _locationIdCache = res.locations[0].id;
   console.log(`📍 Location detectado e cacheado: ${_locationIdCache}`);
   return _locationIdCache;
@@ -246,9 +277,7 @@ async function atualizarEstoqueShopify(token, inventoryItemId, quantity, locatio
     console.warn('⚠️ inventoryItemId não informado. Pulando atualização de estoque.');
     return;
   }
-
   const locId = locationId || await obterLocationId(token);
-
   const opcoes = {
     hostname: `${CONFIG.shopify.loja}.myshopify.com`,
     path: '/admin/api/2026-07/inventory_levels/set.json',
@@ -270,15 +299,20 @@ async function atualizarEstoqueShopify(token, inventoryItemId, quantity, locatio
 }
 
 // ============================================================
-// ATUALIZAR PRODUTO (PREÇO, OPÇÕES, E ESTOQUE VIA API SEPARADA)
+// ATUALIZAR PRODUTO (PREÇO, OPÇÕES, IMAGENS E ESTOQUE)
+// ------------------------------------------------------------
+// opcoesSync:
+//   preservarDescricao — se true, NÃO inclui body_html no payload
+//   (mantém o que já está na Shopify, mesmo que o Hiper tenha uma
+//   descrição diferente — usado quando detectamos edição manual).
+//   preservarImagens — mesma ideia, mas pra images.
 // ============================================================
-async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
+async function atualizarProdutoShopify(token, produtoHiper, produtoExistente, opcoesSync = {}) {
   console.log(`🔄 ATUALIZANDO produto "${produtoHiper.nome}" (preço e opções)...`);
   if (!produtoExistente || !produtoExistente.variants || produtoExistente.variants.length === 0) {
     console.error(`❌ Produto "${produtoHiper.nome}" não tem variantes válidas.`);
     return null;
   }
-
   const defaultVariant = produtoExistente.variants.find(v => v.title === 'Default Title');
   if (defaultVariant) {
     console.log(`🔁 Excluindo "Default Title" (ID: ${defaultVariant.id})...`);
@@ -298,24 +332,20 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
       console.warn(`⚠️ Erro ao excluir Default Title: ${erro.message}. Continuando...`);
     }
   }
-
   const temVariacoes = produtoHiper.variacao && produtoHiper.variacao.length > 0;
   const sku = produtoHiper.codigoDeBarras || (temVariacoes ? produtoHiper.variacao[0].codigoDeBarras : '');
   const mapaExistente = {};
   produtoExistente.variants.forEach(v => { mapaExistente[v.sku] = v; });
-
   let variantsAtualizados = [];
   if (temVariacoes) {
     const tipoVariacaoA = produtoHiper.variacao[0]?.tipoVariacaoA || 'Opção 1';
     const tipoVariacaoB = produtoHiper.variacao[0]?.tipoVariacaoB || null;
-
     for (let idx = 0; idx < produtoHiper.variacao.length; idx++) {
       const variacaoHiper = produtoHiper.variacao[idx];
       const varSku = variacaoHiper.codigoDeBarras || `${sku}-V${idx + 1}`;
       const existente = mapaExistente[varSku];
       const variant = { sku: varSku, price: produtoHiper.preco.toString(), option1: variacaoHiper.nomeVariacaoA || 'Padrão' };
       if (tipoVariacaoB) variant.option2 = variacaoHiper.nomeVariacaoB || 'Padrão';
-
       if (existente) {
         variant.id = existente.id;
         if (existente.inventory_item_id) {
@@ -342,12 +372,10 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
     variantsAtualizados.push(variant);
   }
-
   const atualizacao = {
     product: {
       id: produtoExistente.id,
       title: produtoHiper.nome,
-      body_html: produtoHiper.descricao || '',
       vendor: produtoHiper.marca || '',
       product_type: produtoHiper.categoria || '',
       status: produtoHiper.ativo ? 'active' : 'draft',
@@ -355,16 +383,23 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
     }
   };
 
+  if (!opcoesSync.preservarDescricao) {
+    atualizacao.product.body_html = produtoHiper.descricao || '';
+  }
+  if (!opcoesSync.preservarImagens) {
+    const imagens = montarImagensShopify(produtoHiper);
+    if (imagens.length > 0) atualizacao.product.images = imagens;
+  }
+
   if (temVariacoes) {
     const tipoVariacaoA = produtoHiper.variacao[0]?.tipoVariacaoA || 'Opção 1';
     const tipoVariacaoB = produtoHiper.variacao[0]?.tipoVariacaoB || null;
-    const opcoes = [{ name: tipoVariacaoA }];
-    if (tipoVariacaoB) opcoes.push({ name: tipoVariacaoB });
-    atualizacao.product.options = opcoes;
+    const opcoesVariacao = [{ name: tipoVariacaoA }];
+    if (tipoVariacaoB) opcoesVariacao.push({ name: tipoVariacaoB });
+    atualizacao.product.options = opcoesVariacao;
   } else {
     atualizacao.product.options = [{ name: 'Título' }];
   }
-
   const opcoes = {
     hostname: `${CONFIG.shopify.loja}.myshopify.com`,
     path: `/admin/api/2026-07/products/${produtoExistente.id}.json`,
@@ -389,7 +424,7 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente) {
 }
 
 // ============================================================
-// BUSCAR PEDIDOS
+// BUSCAR PEDIDOS NOVOS
 // ============================================================
 function buscarPedidosShopify(token, sinceId = 0) {
   console.log(`🔄 Buscando pedidos novos na Shopify (since_id: ${sinceId})...`);
@@ -408,6 +443,63 @@ function buscarPedidosShopify(token, sinceId = 0) {
 }
 
 // ============================================================
+// BUSCAR PEDIDOS CANCELADOS (pra propagar cancelamento ao Hiper)
+// ============================================================
+function buscarPedidosCanceladosShopify(token, desdeISO) {
+  console.log(`🔄 Buscando pedidos cancelados na Shopify desde ${desdeISO}...`);
+  const path = `/admin/api/2026-07/orders.json?status=cancelled&updated_at_min=${encodeURIComponent(desdeISO)}&limit=250`;
+  const opcoes = {
+    hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+    path,
+    method: 'GET',
+    headers: { 'X-Shopify-Access-Token': token }
+  };
+  return request(opcoes).then(res => {
+    if (res.errors) throw new Error(JSON.stringify(res.errors));
+    console.log(`✅ ${res.orders?.length || 0} pedidos cancelados encontrados.`);
+    return res.orders || [];
+  });
+}
+
+// ============================================================
+// ADICIONA UMA TAG A UM PEDIDO (status vindo do Hiper: faturado,
+// cancelado no Hiper, etc.) — sem apagar as tags que já existem.
+// ============================================================
+async function adicionarTagAoPedidoShopify(token, orderId, novaTag) {
+  try {
+    const opcoesGet = {
+      hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+      path: `/admin/api/2026-07/orders/${orderId}.json?fields=tags`,
+      method: 'GET',
+      headers: { 'X-Shopify-Access-Token': token }
+    };
+    const atual = await request(opcoesGet);
+    if (atual.errors) throw new Error(JSON.stringify(atual.errors));
+
+    const tagsAtuais = (atual.order?.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+    if (tagsAtuais.includes(novaTag)) return true; // já tem a tag
+
+    tagsAtuais.push(novaTag);
+    const opcoesPut = {
+      hostname: `${CONFIG.shopify.loja}.myshopify.com`,
+      path: `/admin/api/2026-07/orders/${orderId}.json`,
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': token
+      }
+    };
+    const res = await request(opcoesPut, JSON.stringify({ order: { id: orderId, tags: tagsAtuais.join(', ') } }));
+    if (res.errors) throw new Error(JSON.stringify(res.errors));
+    console.log(`🏷️ Tag "${novaTag}" adicionada ao pedido ${orderId}.`);
+    return true;
+  } catch (err) {
+    console.warn(`⚠️ Erro ao adicionar tag "${novaTag}" ao pedido ${orderId}: ${err.message}`);
+    return false;
+  }
+}
+
+// ============================================================
 // EXPORTAÇÕES
 // ============================================================
 module.exports = {
@@ -416,6 +508,9 @@ module.exports = {
   criarProdutoShopify,
   atualizarProdutoShopify,
   arquivarProdutoShopify,
+  buscarDadosAtuaisProdutoShopify,
   buscarPedidosShopify,
+  buscarPedidosCanceladosShopify,
+  adicionarTagAoPedidoShopify,
   sleep
 };
