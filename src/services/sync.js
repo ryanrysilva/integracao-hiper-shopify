@@ -2,18 +2,23 @@
 const request = require('../utils/request.js');
 const { carregarEstado, salvarEstado } = require('../utils/stateStore.js');
 const { gerarTokenHiper, buscarProdutosHiper, enviarPedidoParaHiper, consultarPedidoHiper, cancelarPedidoHiper } = require('./hiper.js');
+const { obterCodigoIbge } = require('./ibge.js');
+const { mapearMeioDePagamento } = require('./pagamento.js');
 const {
   gerarTokenShopify,
   buscarProdutoPorSKU,
   criarProdutoShopify,
   atualizarProdutoShopify,
   arquivarProdutoShopify,
+  buscarDadosAtuaisProdutoShopify,
   buscarPedidosShopify,
+  buscarPedidosCanceladosShopify,
+  adicionarTagAoPedidoShopify,
   sleep
 } = require('./shopify.js');
 
 // ============================================================
-// FUNÇÕES AUXILIARES PARA MAPEAMENTO
+// FUNÇÕES AUXILIARES PARA MAPEAMENTO DE PRODUTOS
 // ============================================================
 function extrairMapaProduto(produtoShopifyResp) {
   return {
@@ -140,8 +145,12 @@ async function sincronizar() {
   let ESTADO = await carregarEstado();
   if (ESTADO.falhasPonto === undefined) ESTADO.falhasPonto = 0;
   if (ESTADO.ultimaSyncCompletaEm === undefined) ESTADO.ultimaSyncCompletaEm = 0;
+  if (ESTADO.pedidosMap === undefined) ESTADO.pedidosMap = {};
+  if (ESTADO.ultimaChecagemCancelamentoEm === undefined) ESTADO.ultimaChecagemCancelamentoEm = 0;
 
   const UM_DIA_MS = 24 * 60 * 60 * 1000;
+  const TRINTA_DIAS_MS = 30 * UM_DIA_MS;
+  const MAX_CONSULTAS_POR_CICLO = 20;
 
   try {
     const tokenHiper = await gerarTokenHiper();
@@ -158,12 +167,9 @@ async function sincronizar() {
     // 1. BUSCA DE PRODUTOS
     // ------------------------------------------------------------
     // - ponto=0 (primeira execução) OU 24h+ sem uma sync completa:
-    //   busca tudo de uma vez, como rede de segurança periódica
-    //   (protege contra o caso de "sem novidades" na verdade
-    //   esconder um ponto realmente inválido/expirado no Hiper).
+    //   busca tudo de uma vez, como rede de segurança periódica.
     // - Caso contrário: busca incremental a partir do ponto salvo.
-    //   "Sem novidades" (ver hiper.js) NÃO conta como falha — só
-    //   erros de verdade (rede, autenticação, resposta inesperada)
+    //   "Sem novidades" NÃO conta como falha — só erros de verdade
     //   entram no contador de 3 tentativas antes de forçar uma
     //   sincronização completa de recuperação.
     // ============================================================
@@ -230,20 +236,16 @@ async function sincronizar() {
     // ============================================================
     // 3. ARQUIVAMENTO
     // ------------------------------------------------------------
-    // O endpoint incremental só devolve o que MUDOU desde o último
-    // ponto — não a lista completa de produtos ativos. Por isso só
-    // podemos comparar "mapa inteiro x retornados" (e arquivar quem
-    // sumiu) numa sincronização COMPLETA. Numa incremental,
-    // arquivamos apenas quem veio no próprio lote marcado como
-    // removido/inativo — nunca por ausência na lista, porque a
-    // ausência aí não significa que o produto sumiu, só que ele não
-    // mudou desde o último ponto.
+    // Sync completa: compara mapa inteiro x lista retornada (segura
+    // porque a lista é o snapshot completo). Sync incremental: só
+    // arquiva quem veio no próprio lote marcado como removido/
+    // inativo — nunca por ausência na lista.
     // ============================================================
     let arquivados = 0;
 
     if (sincronizacaoCompleta) {
       if (produtos.length === 0) {
-        console.warn('⚠️ Sincronização completa retornou 0 produtos — isso é incomum. Por segurança, nada será arquivado neste ciclo (evita apagar o catálogo inteiro por engano). Vale checar a integração com o Hiper se isso persistir.');
+        console.warn('⚠️ Sincronização completa retornou 0 produtos — isso é incomum. Por segurança, nada será arquivado neste ciclo. Vale checar a integração com o Hiper se isso persistir.');
       } else {
         const idsAtivos = new Set();
         for (const produto of produtos) {
@@ -270,6 +272,13 @@ async function sincronizar() {
 
     // ============================================================
     // 4. CRIAR/ATUALIZAR PRODUTOS ATIVOS
+    // ------------------------------------------------------------
+    // Antes de atualizar um produto já mapeado, checamos a
+    // descrição ATUAL na Shopify. Se ela for diferente da última
+    // que o próprio robô escreveu, é porque alguém editou
+    // manualmente — nesse caso não sobrescrevemos a descrição (mas
+    // preço, estoque e variantes continuam sendo atualizados
+    // normalmente).
     // ============================================================
     let criados = 0;
     let atualizados = 0;
@@ -293,9 +302,28 @@ async function sincronizar() {
         if (mapaEntry) {
           console.log(`📦 Produto "${produto.nome}" já mapeado (Shopify ID: ${mapaEntry.shopifyId}). Atualizando...`);
           const produtoExistente = mapaParaProdutoExistente(mapaEntry);
-          const atualizado = await atualizarProdutoShopify(tokenShopify, produto, produtoExistente);
+
+          let preservarDescricao = false;
+          let preservarImagens = false;
+          try {
+            const dadosAtuais = await buscarDadosAtuaisProdutoShopify(tokenShopify, mapaEntry.shopifyId);
+            if (mapaEntry.ultimaDescricaoEnviada !== undefined && dadosAtuais.body_html !== mapaEntry.ultimaDescricaoEnviada) {
+              preservarDescricao = true;
+              console.log(`✋ Descrição de "${produto.nome}" foi editada manualmente na Shopify — mantendo como está.`);
+            }
+            if (dadosAtuais.images && dadosAtuais.images.length > 0 && !mapaEntry.imagensEnviadasPeloRobo) {
+              preservarImagens = true;
+            }
+          } catch (erro) {
+            console.warn(`⚠️ Não foi possível checar os dados atuais de "${produto.nome}" na Shopify: ${erro.message}. Seguindo com o comportamento padrão (sobrescreve).`);
+          }
+
+          const atualizado = await atualizarProdutoShopify(tokenShopify, produto, produtoExistente, { preservarDescricao, preservarImagens });
           if (atualizado) {
-            ESTADO.produtosMap[produto.id] = extrairMapaProduto(atualizado);
+            const novaEntry = extrairMapaProduto(atualizado);
+            novaEntry.ultimaDescricaoEnviada = preservarDescricao ? mapaEntry.ultimaDescricaoEnviada : (produto.descricao || '');
+            novaEntry.imagensEnviadasPeloRobo = preservarImagens ? mapaEntry.imagensEnviadasPeloRobo : true;
+            ESTADO.produtosMap[produto.id] = novaEntry;
             atualizados++;
           }
         } else {
@@ -305,16 +333,22 @@ async function sincronizar() {
           }
           if (existe) {
             console.log(`📦 Produto "${produto.nome}" encontrado via busca (SKU: ${sku}). Atualizando e mapeando...`);
-            const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe);
+            const atualizado = await atualizarProdutoShopify(tokenShopify, produto, existe, {});
             if (atualizado) {
-              ESTADO.produtosMap[produto.id] = extrairMapaProduto(atualizado);
+              const novaEntry = extrairMapaProduto(atualizado);
+              novaEntry.ultimaDescricaoEnviada = produto.descricao || '';
+              novaEntry.imagensEnviadasPeloRobo = true;
+              ESTADO.produtosMap[produto.id] = novaEntry;
               atualizados++;
             }
           } else {
             console.log(`🆕 Produto "${produto.nome}" não encontrado (SKU: ${sku}). Criando...`);
             const novo = await criarProdutoShopify(tokenShopify, produto);
             if (novo) {
-              ESTADO.produtosMap[produto.id] = extrairMapaProduto(novo);
+              const novaEntry = extrairMapaProduto(novo);
+              novaEntry.ultimaDescricaoEnviada = produto.descricao || '';
+              novaEntry.imagensEnviadasPeloRobo = true;
+              ESTADO.produtosMap[produto.id] = novaEntry;
               criados++;
             }
           }
@@ -329,11 +363,9 @@ async function sincronizar() {
     // ============================================================
     // 5. ATUALIZA PONTO DE SINCRONIZAÇÃO
     // ------------------------------------------------------------
-    // Regra única: confiamos sempre no valor que o HIPER devolveu.
-    // Nunca recalculamos localmente (ex: com produtos.length) e
-    // nunca bloqueamos a atualização comparando com o valor antigo
-    // — o ponto é um cursor controlado pelo Hiper, não um contador
-    // nosso, então um valor "menor" não é necessariamente retrocesso.
+    // Confia sempre no valor que o HIPER devolveu. Nunca recalcula
+    // localmente e nunca bloqueia a atualização comparando com o
+    // valor antigo.
     // ============================================================
     if (pontoRetornado !== undefined && pontoRetornado !== null && !isNaN(pontoRetornado)) {
       if (pontoRetornado !== ESTADO.pontoDeSincronizacao) {
@@ -351,47 +383,127 @@ async function sincronizar() {
     console.log(`🔄 ${atualizados} produtos ATUALIZADOS.`);
     console.log(`🗑️ ${arquivados} produtos ARQUIVADOS (removidos do Hiper).`);
 
-    // ============================================================
-    // 6. SALVA ESTADO (antes dos pedidos)
-    // ============================================================
     await salvarEstado(ESTADO);
 
     // ============================================================
-    // 7. PEDIDOS (sempre roda, mesmo em ciclos sem novidade de produto)
+    // 6. PEDIDOS NOVOS (Shopify → Hiper)
+    // ------------------------------------------------------------
+    // Resolve CPF/CNPJ, forma de pagamento e código IBGE reais
+    // antes de enviar. Salva o progresso a CADA pedido processado
+    // (não só no fim do lote) para não reenviar em duplicidade se
+    // o processo cair no meio do caminho.
     // ============================================================
     const pedidos = await buscarPedidosShopify(tokenShopify, ESTADO.ultimoPedidoId || 0);
     let enviados = 0;
-    const pedidosEnviados = [];
+
     for (const pedido of pedidos) {
       try {
-        const resultado = await enviarPedidoParaHiper(tokenHiper, pedido, mapaSkuHiper);
-        if (resultado) {
-          enviados++;
-          pedidosEnviados.push({ orderNumber: pedido.order_number, hiperId: resultado.id });
+        if (pedido.cancelled_at) {
+          console.log(`⏭️ Pedido #${pedido.order_number} já está cancelado na Shopify. Não enviando ao Hiper.`);
+        } else {
+          const enderecoEntrega = pedido.shipping_address;
+          const enderecoCobranca = pedido.billing_address || enderecoEntrega;
+
+          const [codigoIbgeEntrega, codigoIbgeCobranca] = await Promise.all([
+            obterCodigoIbge(enderecoEntrega?.province_code, enderecoEntrega?.city),
+            obterCodigoIbge(enderecoCobranca?.province_code, enderecoCobranca?.city)
+          ]);
+          const idMeioDePagamento = mapearMeioDePagamento(pedido);
+
+          const resultado = await enviarPedidoParaHiper(tokenHiper, pedido, mapaSkuHiper, {
+            idMeioDePagamento,
+            codigoIbgeEntrega,
+            codigoIbgeCobranca
+          });
+
+          if (resultado) {
+            enviados++;
+            ESTADO.pedidosMap[pedido.id] = {
+              hiperPedidoId: resultado.id,
+              orderNumber: pedido.order_number,
+              cancelado: false,
+              faturado: false,
+              enviadoEm: Date.now()
+            };
+          }
         }
-        if (pedido.id > ESTADO.ultimoPedidoId) ESTADO.ultimoPedidoId = pedido.id;
       } catch (erro) {
         console.error(`❌ Erro ao enviar pedido #${pedido.order_number}:`, erro.message);
       }
+
+      if (pedido.id > (ESTADO.ultimoPedidoId || 0)) {
+        ESTADO.ultimoPedidoId = pedido.id;
+      }
+      await salvarEstado(ESTADO); // salva a cada pedido — evita duplicidade em caso de crash no meio do lote
       await sleep(300);
     }
     console.log(`\n--- SINC. PEDIDOS CONCLUÍDA ---`);
     console.log(`📦 ${enviados} pedidos enviados para o Hiper.`);
 
-    if (pedidosEnviados.length > 0) {
-      console.log(`\n--- CONSULTANDO STATUS DOS PEDIDOS ENVIADOS ---`);
-      for (const p of pedidosEnviados) {
-        try {
-          await consultarPedidoHiper(tokenHiper, p.hiperId);
-        } catch (erro) {
-          console.error(`❌ Erro ao consultar pedido ${p.hiperId}:`, erro.message);
+    // ============================================================
+    // 7. CANCELAMENTOS NA SHOPIFY → PROPAGA PRO HIPER
+    // ============================================================
+    try {
+      const desdeCancelamento = new Date(ESTADO.ultimaChecagemCancelamentoEm || (Date.now() - UM_DIA_MS)).toISOString();
+      const pedidosCancelados = await buscarPedidosCanceladosShopify(tokenShopify, desdeCancelamento);
+
+      for (const pedidoCancelado of pedidosCancelados) {
+        const entry = ESTADO.pedidosMap[pedidoCancelado.id];
+        if (entry && !entry.cancelado) {
+          try {
+            await cancelarPedidoHiper(tokenHiper, entry.hiperPedidoId);
+            entry.cancelado = true;
+            console.log(`🚫 Pedido #${entry.orderNumber} cancelado na Shopify → cancelado no Hiper também.`);
+          } catch (erro) {
+            console.error(`❌ Erro ao cancelar pedido ${entry.hiperPedidoId} no Hiper:`, erro.message);
+          }
+          await sleep(300);
         }
-        await sleep(300);
       }
+      ESTADO.ultimaChecagemCancelamentoEm = Date.now();
+      await salvarEstado(ESTADO);
+    } catch (erro) {
+      console.error(`❌ Erro ao checar cancelamentos na Shopify: ${erro.message}`);
+    }
+
+    // ============================================================
+    // 8. STATUS DOS PEDIDOS NO HIPER → REFLETE NA SHOPIFY
+    // ------------------------------------------------------------
+    // Consulta só pedidos ainda "em aberto" (não cancelados, sem NF
+    // ainda) e enviados nos últimos 30 dias — evita polling infinito
+    // de pedidos antigos e limita o volume de chamadas por ciclo.
+    // Se o Hiper reportar cancelamento, NÃO cancela automaticamente
+    // na Shopify (envolve estorno) — só marca com uma tag pra revisão
+    // manual.
+    // ============================================================
+    const pendentes = Object.entries(ESTADO.pedidosMap)
+      .filter(([, p]) => !p.cancelado && !p.faturado && (Date.now() - (p.enviadoEm || 0)) < TRINTA_DIAS_MS)
+      .slice(0, MAX_CONSULTAS_POR_CICLO);
+
+    for (const [shopifyOrderId, entry] of pendentes) {
+      try {
+        const status = await consultarPedidoHiper(tokenHiper, entry.hiperPedidoId);
+
+        if (status.cancelado && !entry.cancelado) {
+          entry.cancelado = true;
+          await adicionarTagAoPedidoShopify(tokenShopify, shopifyOrderId, 'Hiper-Cancelado');
+          console.warn(`🚫 Pedido #${entry.orderNumber} foi cancelado no HIPER. Tag adicionada na Shopify — revise manualmente se precisa estornar.`);
+        }
+
+        const eventoComNota = (status.eventos || []).find(e => e.chaveDocumentoFiscal);
+        if (eventoComNota && !entry.faturado) {
+          entry.faturado = true;
+          await adicionarTagAoPedidoShopify(tokenShopify, shopifyOrderId, 'Hiper-Faturado');
+          console.log(`🧾 Pedido #${entry.orderNumber} faturado no Hiper (código: ${status.codigoDoPedidoDeVenda}).`);
+        }
+      } catch (erro) {
+        console.error(`❌ Erro ao consultar pedido ${entry.hiperPedidoId}:`, erro.message);
+      }
+      await sleep(300);
     }
 
     await salvarEstado(ESTADO);
-    console.log(`\n✅ ESTADO SALVO NO UPSTASH (${Object.keys(ESTADO.produtosMap).length} produtos mapeados).`);
+    console.log(`\n✅ ESTADO SALVO NO UPSTASH (${Object.keys(ESTADO.produtosMap).length} produtos mapeados, ${Object.keys(ESTADO.pedidosMap).length} pedidos rastreados).`);
   } catch (erro) {
     console.error('❌ ERRO NA SINCRONIZAÇÃO:', erro.message);
     await salvarEstado(ESTADO).catch(() => {});
