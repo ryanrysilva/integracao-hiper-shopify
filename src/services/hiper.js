@@ -44,8 +44,6 @@ function buscarProdutosHiper(token, pontoSinc) {
       console.log(`ℹ️ Hiper: nenhuma novidade a partir do ponto ${pontoSinc}.`);
       return {
         produtos: [],
-        // Se o Hiper não mandar um novo ponto junto do "sem novidades",
-        // mantemos o ponto atual — não há motivo pra mudá-lo.
         pontoDeSincronizacao: (res.pontoDeSincronizacao !== undefined && res.pontoDeSincronizacao !== null)
           ? res.pontoDeSincronizacao
           : pontoSinc,
@@ -83,24 +81,42 @@ function buscarProdutosHiper(token, pontoSinc) {
   });
 }
 
-function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
+// ============================================================
+// ENVIA PEDIDO DE VENDA PARA O HIPER
+// ------------------------------------------------------------
+// enriquecimento (opcional, resolvido em sync.js antes de chamar):
+//   documentoCliente     — CPF/CNPJ já limpo (só dígitos)
+//   idMeioDePagamento    — ID do meio de pagamento no Hiper
+//   codigoIbgeEntrega    — código IBGE da cidade de entrega
+//   codigoIbgeCobranca   — código IBGE da cidade de cobrança
+// Se não vier nada, cai nos mesmos fallbacks de antes (documento
+// genérico, pagamento 4 = cartão de crédito, IBGE 0).
+// ============================================================
+function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper, enriquecimento = {}) {
   console.log(`🔄 Enviando pedido #${pedidoShopify.order_number} para o Hiper...`);
+
   const cliente = {
-    documento: '00000000000',
+    documento: enriquecimento.documentoCliente || '00000000000',
     email: pedidoShopify.email || pedidoShopify.customer?.email || 'cliente@email.com',
     inscricaoEstadual: '',
     nomeDoCliente: pedidoShopify.customer?.first_name + ' ' + pedidoShopify.customer?.last_name || 'Cliente',
     nomeFantasia: ''
   };
-  if (pedidoShopify.note_attributes) {
-    const cpfAttr = pedidoShopify.note_attributes.find(a => a.name === 'cpf' || a.name === 'documento');
+
+  if (!enriquecimento.documentoCliente && pedidoShopify.note_attributes) {
+    const nomesPossiveis = ['cpf', 'documento', 'cpf/cnpj', 'cpf_cnpj', 'documento_fiscal', 'tax_id', 'cnpj'];
+    const cpfAttr = pedidoShopify.note_attributes.find(a => nomesPossiveis.includes((a.name || '').toLowerCase()));
     if (cpfAttr) cliente.documento = cpfAttr.value.replace(/\D/g, '');
   }
+  if (cliente.documento === '00000000000') {
+    console.warn(`⚠️ Pedido #${pedidoShopify.order_number}: CPF/CNPJ do cliente não encontrado. Enviando documento genérico — pode ser necessário corrigir manualmente no Hiper para emissão fiscal.`);
+  }
+
   const shipping = pedidoShopify.shipping_address || {};
   const enderecoEntrega = {
     bairro: shipping.city || '',
     cep: (shipping.zip || '').replace(/\D/g, ''),
-    codigoIbge: 0,
+    codigoIbge: enriquecimento.codigoIbgeEntrega || 0,
     complemento: shipping.address2 || '',
     logradouro: shipping.address1 || '',
     numero: '0'
@@ -109,11 +125,12 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
   const enderecoCobranca = {
     bairro: billing.city || '',
     cep: (billing.zip || '').replace(/\D/g, ''),
-    codigoIbge: 0,
+    codigoIbge: enriquecimento.codigoIbgeCobranca || 0,
     complemento: billing.address2 || '',
     logradouro: billing.address1 || '',
     numero: '0'
   };
+
   const itens = [];
   for (const item of pedidoShopify.line_items || []) {
     const sku = item.sku || '';
@@ -133,16 +150,19 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper) {
     console.warn(`⚠️ Pedido #${pedidoShopify.order_number} não tem itens válidos. Ignorando.`);
     return Promise.resolve(null);
   }
+
   const total = parseFloat(pedidoShopify.total_price) || 0;
   const meiosPagamento = [{
-    idMeioDePagamento: 4,
+    idMeioDePagamento: enriquecimento.idMeioDePagamento || 4,
     parcelas: 1,
     valor: total
   }];
+
   let valorFrete = 0;
   if (pedidoShopify.shipping_lines && pedidoShopify.shipping_lines.length > 0) {
     valorFrete = parseFloat(pedidoShopify.shipping_lines[0].price) || 0;
   }
+
   const payloadHiper = {
     cliente: cliente,
     enderecoDeCobranca: enderecoCobranca,
