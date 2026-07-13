@@ -412,6 +412,8 @@ async function sincronizar() {
           ]);
           const idMeioDePagamento = mapearMeioDePagamento(pedido);
 
+          console.log(`🔎 Pedido #${pedido.order_number}: documento resolvido = "${documentoCliente || '(não encontrado)'}" | IBGE entrega = ${codigoIbgeEntrega || '(não resolvido)'} | IBGE cobrança = ${codigoIbgeCobranca || '(não resolvido)'} | meio de pagamento = ${idMeioDePagamento}`);
+
           if (!codigoIbgeEntrega || !documentoCliente) {
             console.warn(`⚠️ Pedido #${pedido.order_number}: ${!documentoCliente ? 'CPF/CNPJ não encontrado' : ''}${!documentoCliente && !codigoIbgeEntrega ? ' e ' : ''}${!codigoIbgeEntrega ? `código IBGE não resolvido para "${enderecoEntrega?.city}/${enderecoEntrega?.province_code}"` : ''}. O Hiper provavelmente vai rejeitar este pedido — verifique manualmente se persistir.`);
           }
