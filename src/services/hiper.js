@@ -167,6 +167,13 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper, enriquec
     valorFrete = parseFloat(pedidoShopify.shipping_lines[0].price) || 0;
   }
 
+  // Marketplace.Cnpj só é exigido pelo Hiper quando o estabelecimento
+  // é de Santa Catarina (SC). O valor fixo que existia antes
+  // ('12345678901234') NÃO é um CNPJ válido — era um placeholder que
+  // nunca foi trocado. Agora só enviamos o bloco Marketplace se um
+  // CNPJ real estiver configurado em HIPER_MARKETPLACE_CNPJ.
+  const marketplaceCnpj = (process.env.HIPER_MARKETPLACE_CNPJ || '').replace(/\D/g, '');
+
   const payloadHiper = {
     cliente: cliente,
     enderecoDeCobranca: enderecoCobranca,
@@ -176,10 +183,7 @@ function enviarPedidoParaHiper(tokenHiper, pedidoShopify, mapaSkuHiper, enriquec
     numeroPedidoDeVenda: pedidoShopify.order_number.toString(),
     observacaoDoPedidoDeVenda: `Pedido Shopify #${pedidoShopify.order_number}`,
     valorDoFrete: valorFrete,
-    Marketplace: {
-      Cnpj: '12345678901234',
-      Nome: 'Shopify'
-    }
+    ...(marketplaceCnpj ? { Marketplace: { Cnpj: marketplaceCnpj, Nome: 'Shopify' } } : {})
   };
   const opcoes = {
     hostname: 'ms-ecommerce.hiper.com.br',
