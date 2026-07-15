@@ -190,6 +190,7 @@ function criarProdutoShopify(token, produtoHiper) {
       const variant = {
         sku: varSku,
         price: produtoHiper.preco.toString(),
+        inventory_management: 'shopify',
         inventory_quantity: Math.floor(variacao.quantidadeEmEstoque || 0)
       };
       variant.option1 = variacao.nomeVariacaoA || 'Padrão';
@@ -203,6 +204,7 @@ function criarProdutoShopify(token, produtoHiper) {
     produtoShopify.product.variants.push({
       sku: sku,
       price: produtoHiper.preco.toString(),
+      inventory_management: 'shopify',
       inventory_quantity: Math.floor(produtoHiper.quantidadeEmEstoque || 0),
       option1: produtoHiper.nome
     });
@@ -344,7 +346,7 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente, op
       const variacaoHiper = produtoHiper.variacao[idx];
       const varSku = variacaoHiper.codigoDeBarras || `${sku}-V${idx + 1}`;
       const existente = mapaExistente[varSku];
-      const variant = { sku: varSku, price: produtoHiper.preco.toString(), option1: variacaoHiper.nomeVariacaoA || 'Padrão' };
+      const variant = { sku: varSku, price: produtoHiper.preco.toString(), option1: variacaoHiper.nomeVariacaoA || 'Padrão', inventory_management: 'shopify' };
       if (tipoVariacaoB) variant.option2 = variacaoHiper.nomeVariacaoB || 'Padrão';
       if (existente) {
         variant.id = existente.id;
@@ -360,7 +362,7 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente, op
     }
   } else {
     const existente = mapaExistente[sku];
-    const variant = { sku: sku, price: produtoHiper.preco.toString(), option1: produtoHiper.nome };
+    const variant = { sku: sku, price: produtoHiper.preco.toString(), option1: produtoHiper.nome, inventory_management: 'shopify' };
     if (existente) {
       variant.id = existente.id;
       if (existente.inventory_item_id) {
