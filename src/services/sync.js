@@ -380,6 +380,8 @@ async function sincronizar() {
 
           let preservarDescricao = false;
           let preservarImagens = false;
+          let removidoNaShopify = false;
+
           try {
             const dadosAtuais = await buscarDadosAtuaisProdutoShopify(tokenShopify, mapaEntry.shopifyId);
             if (mapaEntry.ultimaDescricaoEnviada !== undefined && dadosAtuais.body_html !== mapaEntry.ultimaDescricaoEnviada) {
@@ -390,18 +392,41 @@ async function sincronizar() {
               preservarImagens = true;
             }
           } catch (erro) {
-            console.warn(`⚠️ Não foi possível checar os dados atuais de "${produto.nome}" na Shopify: ${erro.message}. Seguindo com o comportamento padrão (sobrescreve).`);
+            if (/not found/i.test(erro.message)) {
+              removidoNaShopify = true;
+            } else {
+              console.warn(`⚠️ Não foi possível checar os dados atuais de "${produto.nome}" na Shopify: ${erro.message}. Seguindo com o comportamento padrão (sobrescreve).`);
+            }
           }
 
-          const atualizado = await atualizarProdutoShopify(tokenShopify, produto, produtoExistente, { preservarDescricao, preservarImagens });
-          if (atualizado) {
-            const novaEntry = extrairMapaProduto(atualizado);
-            novaEntry.ultimaDescricaoEnviada = preservarDescricao ? mapaEntry.ultimaDescricaoEnviada : (produto.descricao || '');
-            novaEntry.imagensEnviadasPeloRobo = preservarImagens ? mapaEntry.imagensEnviadasPeloRobo : true;
-            ESTADO.produtosMap[produto.id] = novaEntry;
-            atualizados++;
+          if (!removidoNaShopify) {
+            try {
+              const atualizado = await atualizarProdutoShopify(tokenShopify, produto, produtoExistente, { preservarDescricao, preservarImagens });
+              if (atualizado) {
+                const novaEntry = extrairMapaProduto(atualizado);
+                novaEntry.ultimaDescricaoEnviada = preservarDescricao ? mapaEntry.ultimaDescricaoEnviada : (produto.descricao || '');
+                novaEntry.imagensEnviadasPeloRobo = preservarImagens ? mapaEntry.imagensEnviadasPeloRobo : true;
+                ESTADO.produtosMap[produto.id] = novaEntry;
+                atualizados++;
+              }
+            } catch (erro) {
+              if (/not found/i.test(erro.message)) {
+                removidoNaShopify = true;
+              } else {
+                throw erro;
+              }
+            }
           }
-        } else {
+
+          if (removidoNaShopify) {
+            console.warn(`🔁 Produto "${produto.nome}" não existe mais na Shopify (ID antigo: ${mapaEntry.shopifyId} — provavelmente excluído manualmente). Removendo mapeamento antigo e recriando agora...`);
+            delete ESTADO.produtosMap[produto.id];
+          }
+        }
+
+        // Sem mapeamento (nunca existiu OU acabou de ser detectado como
+        // excluído manualmente acima) — busca por metafield/SKU ou cria do zero.
+        if (!ESTADO.produtosMap[produto.id]) {
           let existe = await buscarProdutoPorMetafield(tokenShopify, produto.id);
           if (!existe) {
             existe = await buscarProdutoPorSKU(tokenShopify, sku);
