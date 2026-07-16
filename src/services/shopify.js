@@ -414,12 +414,19 @@ async function atualizarProdutoShopify(token, produtoHiper, produtoExistente, op
   try {
     const res = await request(opcoes, JSON.stringify(atualizacao));
     if (res.errors) {
-      console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${JSON.stringify(res.errors)}`);
+      const mensagemErro = typeof res.errors === 'string' ? res.errors : JSON.stringify(res.errors);
+      if (/not found/i.test(mensagemErro)) {
+        throw new Error('Not Found');
+      }
+      console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${mensagemErro}`);
       return null;
     }
     console.log(`✅ Produto "${produtoHiper.nome}" ATUALIZADO (preço e opções) na Shopify!`);
     return res.product;
   } catch (erro) {
+    if (/not found/i.test(erro.message)) {
+      throw erro; // propaga — quem chamou (sync.js) trata como "produto excluído, precisa recriar"
+    }
     console.error(`❌ Erro ao atualizar "${produtoHiper.nome}": ${erro.message}`);
     return null;
   }
